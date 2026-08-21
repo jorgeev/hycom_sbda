@@ -115,6 +115,7 @@ def main():
     spec = resolve_spec(cfg)
     if is_main():
         os.makedirs(cfg.out, exist_ok=True)
+        os.makedirs(os.path.join(cfg.out, "checkpoints"), exist_ok=True)
         print(f"[cfg] mode={cfg.mode} k={cfg.k_days} Cc={cfg.cond_channels()} "
               f"Ct={cfg.target_channels()} in_ch={cfg.in_channels()} world={world}")
         print(f"[data] dataset={spec.name} stores={len(spec.stores)} "
@@ -166,12 +167,21 @@ def main():
     # resume
     start_step = 0
     ckpt_path = os.path.join(cfg.out, "ckpt.pt")
+    # ckpt.pt is the *latest* state and the implicit resume target; it gets
+    # overwritten, so every validation round also drops an immutable snapshot in
+    # ckpt_dir and refreshes best_path when the val loss improves.
+    ckpt_dir = os.path.join(cfg.out, "checkpoints")
+    best_path = os.path.join(cfg.out, "best.pt")
+    best_val = float("inf")
     if os.path.exists(ckpt_path) and os.path.getsize(ckpt_path) > 0:
         sd = torch.load(ckpt_path, map_location=device)
         net.load_state_dict(sd["model"])
         ema.load_state_dict(sd["ema"])
         opt.load_state_dict(sd["opt"])
         start_step = sd["step"] + 1
+        # .get: checkpoints written before best.pt existed have no best_val, and
+        # must still resume -- they just start tracking the best from scratch.
+        best_val = sd.get("best_val", float("inf"))
         if is_main():
             print(f"[resume] from step {start_step}")
     elif os.path.exists(ckpt_path) and is_main():
@@ -225,6 +235,20 @@ def main():
             row["val_loss"] = "" if val is None else val
         logger.log(row)
 
+    def ckpt_state(step: int, val: float | None = None) -> dict:
+        """The checkpoint payload, built in one place for all four save sites.
+
+        model/ema/opt/step/config are exactly the keys every existing checkpoint
+        carries, so sample.load_precond and the resume path above keep working;
+        best_val and val_loss are purely additive.
+        """
+        st = {"model": net.state_dict(), "ema": ema.state_dict(),
+              "opt": opt.state_dict(), "step": step, "config": cfg.as_dict(),
+              "best_val": best_val}
+        if val is not None:
+            st["val_loss"] = val
+        return st
+
     net.train()
     it = batches()
     for step in range(start_step, cfg.steps):
@@ -258,16 +282,25 @@ def main():
             if is_main():
                 print(f"step {step:>7d}  val_loss {vl:.4f}")
                 log_row(step, loss.item(), vl)
+                # Archive this round. Without it, log.csv can tell you which
+                # step was best long after ckpt.pt has overwritten its weights.
+                # The file is named by *completed* steps (step + 1, matching the
+                # val cadence); the "step" field inside stays 0-indexed so a
+                # snapshot is still a valid resume target.
+                improved = vl < best_val
+                if improved:
+                    best_val = vl
+                state = ckpt_state(step, val=vl)
+                save_ckpt(state, os.path.join(ckpt_dir,
+                                              f"ckpt_step{step + 1:07d}.pt"))
+                if improved:
+                    save_ckpt(state, best_path)
 
         if is_main() and (step + 1) % cfg.ckpt_every == 0:
-            save_ckpt({"model": net.state_dict(), "ema": ema.state_dict(),
-                       "opt": opt.state_dict(), "step": step, "config": cfg.as_dict()},
-                      ckpt_path)
+            save_ckpt(ckpt_state(step), ckpt_path)
 
     if is_main():
-        save_ckpt({"model": net.state_dict(), "ema": ema.state_dict(),
-                   "opt": opt.state_dict(), "step": cfg.steps - 1,
-                   "config": cfg.as_dict()}, ckpt_path)
+        save_ckpt(ckpt_state(cfg.steps - 1), ckpt_path)
         print(f"[done] saved {ckpt_path}")
     cleanup_ddp()
 
