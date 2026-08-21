@@ -128,8 +128,31 @@ def compute_norm_stats(
 # harmonic instead of raw monthly means because this dataset has only ~4 training
 # years -- 12 monthly means from 4 samples each would alias mesoscale eddies into
 # the "climatology" and get subtracted out of the very signal we are modelling.
+#
+# ``clim_mode: monthly`` is the alternative, added for records where the
+# harmonic is *not* the right basis -- see :func:`_monthly_design`.
 _HARMONICS = 2   # annual + semiannual
 _YEAR_S = 365.2425 * 86400.0
+
+# Month lengths in days of a _YEAR_S year. The leap fraction is parked on
+# February so the twelve sum to exactly 365.2425 and the phase table below
+# closes on 2*pi; that puts each centre within a quarter-day of the true
+# calendar mid-month, which is far finer than the structure being fit.
+_MONTH_DAYS = np.array(
+    [31.0, 28.2425, 31.0, 30.0, 31.0, 30.0, 31.0, 31.0, 30.0, 31.0, 30.0, 31.0]
+)
+_MONTH_EDGE = np.concatenate([[0.0], np.cumsum(_MONTH_DAYS)])          # (13,)
+# Phase of each month's mid-point -- the knots of the monthly climatology.
+_MONTH_ANG = 2.0 * np.pi * (
+    (_MONTH_EDGE[:-1] + 0.5 * _MONTH_DAYS) / (_YEAR_S / 86400.0)
+)
+# Shrinkage of the monthly deviations toward the per-pixel time-mean, in units
+# of effective samples: a month with n effective samples keeps n/(n+lambda) of
+# its deviation. At 1.0 any month with even a few days of coverage is left
+# essentially untouched, while a month the record never visits collapses to the
+# time-mean instead of to zero -- which is what makes the fit safe on a record
+# that does not cover the whole year.
+_MONTH_RIDGE = 1.0
 
 
 def _doy_angle(t_unix: np.ndarray) -> np.ndarray:
@@ -146,15 +169,96 @@ def _harmonic_design(ang: np.ndarray) -> np.ndarray:
     return np.stack(cols, axis=1)
 
 
+def _monthly_design(ang: np.ndarray) -> np.ndarray:
+    """(T, 1 + 12) design matrix: time-mean, then twelve monthly deviations.
+
+    The harmonic basis above assumes the seasonal cycle *is* an annual plus
+    semiannual sinusoid, which needs a record long enough to identify one. Where
+    that does not hold -- a strongly non-sinusoidal spring warming, or a record
+    covering only part of a year -- a monthly climatology is the honest basis
+    instead: twelve per-pixel values, one per calendar month.
+
+    Those twelve are placed at the month mid-points (``_MONTH_ANG``) and joined
+    by linear interpolation *around the circle*, so the climatology varies
+    smoothly with time rather than stepping by a degree or more at midnight on
+    the 1st -- on an hourly record such a step is a pure artifact of the binning
+    and the network would have to spend capacity absorbing it. Each row
+    therefore has the intercept plus exactly two non-zero interpolation weights
+    summing to one.
+
+    Columns 1..12 are deviations from column 0, not absolute monthly means. The
+    basis is deliberately rank-deficient that way (the twelve weights sum to the
+    intercept), which is what lets the ridge in :func:`fit_climatology` shrink an
+    unobserved month toward the per-pixel time-mean rather than toward zero.
+    """
+    ang = np.mod(np.asarray(ang, dtype=np.float64), 2.0 * np.pi)
+    # Locate each sample between two adjacent month centres, wrapping Dec->Jan.
+    j = np.searchsorted(_MONTH_ANG, ang) - 1          # -1 when before Jan centre
+    lo_ang = _MONTH_ANG[j % 12]
+    hi_ang = _MONTH_ANG[(j + 1) % 12]
+    span = np.mod(hi_ang - lo_ang, 2.0 * np.pi)
+    w = np.mod(ang - lo_ang, 2.0 * np.pi) / span      # 0 at lo centre, 1 at hi
+
+    d = np.zeros((ang.shape[0], 13))
+    d[:, 0] = 1.0
+    rows = np.arange(ang.shape[0])
+    np.add.at(d, (rows, 1 + (j % 12)), 1.0 - w)
+    np.add.at(d, (rows, 1 + ((j + 1) % 12)), w)
+    return d
+
+
+def _design(ang: np.ndarray, p: int) -> np.ndarray:
+    """Design matrix with ``p`` columns, the one :func:`fit_climatology` used.
+
+    Fit and evaluation must agree on the basis or the subtracted field is not
+    the field that was fit, so both go through here and the column count is the
+    only thing that selects a basis.
+    """
+    if p == 1:
+        return np.ones((np.shape(ang)[0], 1))
+    if p == 1 + 2 * _HARMONICS:
+        return _harmonic_design(ang)
+    if p == 13:
+        return _monthly_design(ang)
+    raise ValueError(f"no climatology basis with {p} columns")
+
+
+def _clim_basis(seasonal: bool, mode: str) -> int:
+    """Number of coefficients for ``mode``; 1 (time-mean) when not seasonal."""
+    if not seasonal:
+        return 1
+    if mode == "harmonic":
+        return 1 + 2 * _HARMONICS
+    if mode == "monthly":
+        return 13
+    raise ValueError(f"Unknown clim_mode {mode!r}")
+
+
+def _clim_ridge(p: int) -> np.ndarray:
+    """(P, P) ridge for the normal equations.
+
+    The tiny term is what keeps land pixels -- all-zero, zero-count -- solvable.
+    The monthly basis additionally shrinks its twelve deviation columns (but not
+    the intercept) toward zero, i.e. the climatology toward the per-pixel
+    time-mean, wherever a month is thinly covered or absent.
+    """
+    reg = 1e-8 * np.eye(p)
+    if p == 13:
+        reg[1:, 1:] += _MONTH_RIDGE * np.eye(12)
+    return reg
+
+
 def fit_climatology(
     arr: np.ndarray, ang: np.ndarray, ocean: np.ndarray, seasonal: bool,
     *, days: np.ndarray | None = None, chunk: int = 8192,
+    mode: str = "harmonic",
 ) -> np.ndarray:
     """Per-pixel climatology coefficients from ``arr`` (T, NY, NX).
 
-    ``days`` restricts the fit to those time indices (use the train split).
-    Returns ``(1 + 2*_HARMONICS, NY, NX)`` when ``seasonal`` (least-squares
-    harmonic fit), else ``(1, NY, NX)`` holding just the per-pixel time-mean.
+    ``days`` restricts the fit to those time indices. Returns ``(P, NY, NX)``
+    where ``P`` is 1 when not ``seasonal`` (just the per-pixel time-mean),
+    ``1 + 2*_HARMONICS`` under ``mode="harmonic"``, and 13 under
+    ``mode="monthly"`` (time-mean plus twelve monthly deviations).
     Land pixels and non-finite samples are excluded; land coefficients are 0.
 
     Pixels are independent and share the design matrix, so this is a batch of
@@ -169,10 +273,10 @@ def fit_climatology(
         ang = ang[days]
     npix = flat.shape[1]
 
-    d = _harmonic_design(ang) if seasonal else np.ones((flat.shape[0], 1))
-    p = d.shape[1]
+    p = _clim_basis(seasonal, mode)
+    d = _design(ang, p)
     dd = (d[:, :, None] * d[:, None, :]).reshape(-1, p * p)   # (T, P*P)
-    eye = 1e-8 * np.eye(p)                                    # keeps land solvable
+    eye = _clim_ridge(p)
     coef = np.zeros((p, npix))
 
     for lo in range(0, npix, chunk):
@@ -194,11 +298,12 @@ def evaluate_climatology(coef: np.ndarray, ang: float | np.ndarray) -> np.ndarra
 
     A scalar ``ang`` returns one ``(NY, NX)`` field; an array returns
     ``(len(ang), NY, NX)``. ``coef`` with a leading dim of 1 is a static
-    time-mean, so the phase is ignored.
+    time-mean, so the phase is ignored; the basis is otherwise selected by the
+    coefficient count, so a cached fit stays self-describing.
     """
     scalar = np.ndim(ang) == 0
     ang = np.atleast_1d(np.asarray(ang, dtype=np.float64))
-    d = _harmonic_design(ang)[:, : coef.shape[0]]      # (T, P), P=1 for time-mean
+    d = _design(ang, coef.shape[0])                    # (T, P), P=1 for time-mean
     out = np.tensordot(d, coef, axes=(1, 0)).astype(np.float32)   # (T, NY, NX)
     return out[0] if scalar else out
 
@@ -216,9 +321,22 @@ def subtract_climatology_(arr: np.ndarray, coef: np.ndarray, ang: np.ndarray,
         arr[lo:hi] -= evaluate_climatology(coef, ang[lo:hi])
 
 
-def _clim_key(var: str, seasonal: bool, t_end: int, n_train: int) -> str:
-    """Cache key: the coefficients depend on the variable and the fit window."""
-    return f"{var}|{'seas' if seasonal else 'mean'}|{t_end}|{n_train}"
+def _clim_key(var: str, seasonal: bool, t_end: int, n_train: int,
+              *, mode: str = "harmonic", n_clim: int | None = None) -> str:
+    """Cache key: the coefficients depend on the variable and the fit window.
+
+    The harmonic fit over the train split keeps the original three-field key
+    verbatim, so every cache written before ``clim_mode`` existed is still a hit
+    and no existing run silently refits. Anything else -- a different basis, or
+    a climatology fit over a window that is not the train split -- appends the
+    fields that distinguish it.
+    """
+    base = f"{var}|{'seas' if seasonal else 'mean'}|{t_end}|{n_train}"
+    if seasonal and mode != "harmonic":
+        base += f"|{mode}"
+    if n_clim is not None and n_clim != n_train:
+        base += f"|clim{n_clim}"
+    return base
 
 
 def _load_clim_cache(path: str) -> dict[str, tuple[np.ndarray, float]]:
@@ -339,7 +457,8 @@ class ZarrWindowDataset(Dataset):
             self.clim = share_from.clim
             self.data = share_from.data
         elif cfg.norm_mode == "anomaly":
-            spec.warn_climatology(list(cfg.clim_vars))
+            spec.warn_climatology(list(cfg.clim_vars), mode=cfg.clim_mode,
+                                  full_record=cfg.clim_full_record)
             self.stats, self.clim, self.data = self._load_anomaly()
         elif cfg.norm_mode == "zscore":
             self.clim = {}
@@ -460,12 +579,22 @@ class ZarrWindowDataset(Dataset):
         """Preload channels as GenDA-style anomalies.
 
         Per variable: log10 first if lognormal, subtract a per-pixel climatology
-        (harmonic in day-of-year for ``clim_vars``, plain time-mean otherwise)
-        fit on the **train split only**, then divide by a scalar anomaly std.
+        (seasonal in day-of-year for ``clim_vars`` -- harmonic or monthly per
+        ``clim_mode`` -- plain time-mean otherwise), then divide by a scalar
+        anomaly std fit on the **train split only**.
 
-        Unlike :func:`compute_norm_stats`, this path is fit strictly on the train
-        split -- it is newer code with no checkpoints depending on it, so the
-        leakage noted in that function is simply not reproduced.
+        Unlike :func:`compute_norm_stats`, the anomaly std here is fit strictly
+        on the train split -- it is newer code with no checkpoints depending on
+        it, so the leakage noted in that function is simply not reproduced.
+
+        The climatology follows the same rule by default. ``clim_full_record``
+        widens *only* the climatology fit to every step, which is needed when a
+        calendar month is absent from the train split: a monthly climatology has
+        no coefficient for a month it never saw, and shrinks it to the time-mean
+        (see :func:`_monthly_design`), leaving the whole seasonal march in the
+        residual for those steps. Widening the window is a deliberate, bounded
+        leak -- the smooth monthly mean field, nothing else -- and it makes
+        validation metrics correspondingly optimistic.
         """
         cfg = self.cfg
         spec = self.spec
@@ -503,10 +632,16 @@ class ZarrWindowDataset(Dataset):
                         f"{spec.var(v).cadence!r}"
                     )
 
+            # The std is always a train-split quantity; the climatology may be
+            # fit over every step (see the docstring).
+            clim_days = None if cfg.clim_full_record else train_days
+            n_clim = int(arr.shape[0]) if clim_days is None else int(clim_days.size)
             key = _clim_key(spec.cache_key(v), seasonal,
-                            int(arr.shape[0]), int(train_days.size))
+                            int(arr.shape[0]), int(train_days.size),
+                            mode=cfg.clim_mode, n_clim=n_clim)
             coef = cache[key][0] if key in cache else fit_climatology(
-                arr, ang, self.ocean, seasonal, days=train_days
+                arr, ang, self.ocean, seasonal, days=clim_days,
+                mode=cfg.clim_mode,
             )
             subtract_climatology_(arr, coef, ang)
 

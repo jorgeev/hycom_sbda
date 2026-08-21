@@ -85,6 +85,19 @@ class Config:
     # per-variable anomaly std.
     norm_mode: str = "zscore"            # {"zscore", "anomaly"}
     clim_vars: list[str] = field(default_factory=list)
+    # Basis for the seasonal climatology of ``clim_vars``. "harmonic" = annual +
+    # semiannual sinusoid, the default and what every existing checkpoint used;
+    # it needs a record long enough (~2 yr) to identify an annual period.
+    # "monthly" = twelve per-pixel monthly values interpolated smoothly in
+    # day-of-year, which is the right basis for a strongly non-sinusoidal cycle
+    # or a record covering only part of a year.
+    clim_mode: str = "harmonic"          # {"harmonic", "monthly"}
+    # Fit the climatology over every step rather than the train split. The
+    # anomaly *std* stays train-only either way. Needed when a calendar month
+    # falls entirely outside the train split, since the monthly basis has no
+    # coefficient for a month it never saw; it makes val metrics optimistic by
+    # the amount the monthly mean field itself carries.
+    clim_full_record: bool = False
     clim_cache: str = "${CACHE_DIR:-diffusion}/_clim_cache.npz"
     val_gap_days: int = 0                # drop this many steps off the end of train
     # Reject conditioning windows that straddle a gap in the time axis. Off by

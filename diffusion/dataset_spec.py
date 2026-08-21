@@ -507,23 +507,59 @@ class DatasetSpec:
                 f"{downsample} (the UNet's total downsample factor), got {ny}x{nx}"
             )
 
-    def warn_climatology(self, clim_vars: list[str]) -> None:
-        """Warn when a seasonal harmonic is asked of a record too short to fit one.
+    def warn_climatology(self, clim_vars: list[str], *, mode: str = "harmonic",
+                         full_record: bool = False) -> None:
+        """Warn when the requested climatology basis outruns the record.
 
-        The climatology in ``data.py`` is an annual + semiannual harmonic. Fitting
-        that to well under a year is not merely noisy, it is unidentifiable: the
-        fit absorbs whatever transient signal happens to be present and then
-        subtracts it from the field being modelled.
+        Each basis fails a short record differently, so the check is per mode.
+        The harmonic one is an annual + semiannual sinusoid: fitting that to well
+        under a year is not merely noisy, it is unidentifiable, and the fit
+        absorbs whatever transient signal happens to be present and subtracts it
+        from the field being modelled. The monthly one is identifiable from a
+        few months -- that is the point of it -- but on a single-year record each
+        "climatological" month is estimated from that one year alone, so the
+        month-to-month variability of that year is removed along with the
+        seasonal cycle. Both are judgement calls, hence a warning rather than an
+        error.
         """
         if not clim_vars:
             return
         t = self.family.times(self.base)
         years = float(t[-1] - t[0]) / (365.2425 * 86400.0)
-        if years < 2.0:
-            print(f"[warn] {self.name}: clim_vars={clim_vars} requests a seasonal "
-                  f"harmonic, but the record spans only {years:.2f} yr. Below ~2 yr "
-                  "the annual/semiannual fit is not identifiable and will absorb "
-                  "real signal; prefer clim_vars: [] (per-pixel time-mean).")
+        if mode == "harmonic":
+            if years < 2.0:
+                print(f"[warn] {self.name}: clim_vars={clim_vars} requests a "
+                      f"seasonal harmonic, but the record spans only {years:.2f} "
+                      "yr. Below ~2 yr the annual/semiannual fit is not "
+                      "identifiable and will absorb real signal; prefer "
+                      "clim_mode: monthly, or clim_vars: [] (per-pixel "
+                      "time-mean).")
+            return
+        if mode == "monthly" and years < 2.0:
+            print(f"[warn] {self.name}: clim_vars={clim_vars} requests a monthly "
+                  f"climatology from a {years:.2f} yr record, so each month's "
+                  "climatology is that single year's own monthly mean -- the "
+                  "month-to-month variability of this year is removed along with "
+                  "the seasonal cycle. Intended here; noted so it is not a "
+                  "surprise in the results.")
+        if mode == "monthly" and not full_record:
+            months = self._train_month_coverage()
+            missing = sorted(set(months["all"]) - set(months["train"]))
+            if missing:
+                print(f"[warn] {self.name}: month(s) {missing} appear in the "
+                      "record but not in the train split, and clim_full_record "
+                      "is off, so their monthly climatology falls back to the "
+                      "per-pixel time-mean and the seasonal signal stays in the "
+                      "residual for those steps. Set clim_full_record: true to "
+                      "fit the climatology over every step.")
+
+    def _train_month_coverage(self) -> dict[str, list[int]]:
+        """Calendar months present in the whole record vs. in the train split."""
+        t = self.family.times(self.base).astype("int64")
+        mo = (t.astype("datetime64[s]").astype("datetime64[M]").astype(int) % 12) + 1
+        n_train = len(self.splits()["train"])
+        return {"all": sorted(set(mo.tolist())),
+                "train": sorted(set(mo[:n_train].tolist()))}
 
 
 # ---------------------------------------------------------------------------
