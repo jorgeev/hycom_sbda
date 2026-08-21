@@ -1,0 +1,74 @@
+# Unconditional joint prior on the Gulf Stream HYCOM family -- the first
+# experiment on a dataset the diffusion code was not written for.
+#
+# Structurally this is prior_genda_masked.yaml (GenDA parity arm B) moved to a
+# new domain: same architecture, same schedule, same EDM settings. What changes
+# is entirely in `dataset:`; not one line of Python knows this store exists.
+dataset: diffusion/datasets/gulfstream.yaml
+
+# --- variables ----------------------------------------------------------
+# Fully unconditional: 3 in / 3 out, no aux channels. `use_ocean_mask` is off
+# both because a GenDA prior takes none and because this domain's mask is all
+# ocean -- the channel would be a constant plane carrying no information.
+target: [ssh, sst, sss]
+cond_vars: []
+use_ocean_mask: false
+use_doy: false
+k_days: 1                     # one step (here: one hour) of state per sample
+
+# --- data / patches ------------------------------------------------------
+# The base cadence is HOURLY, so `k_days`, `crops_per_day` and `n_eval_days`
+# all count hours in this config. 4367 hourly steps, split 3493/874 by the
+# manifest boundary.
+patch: 128
+crop_mode: grid
+reject_land: false
+ocean_frac: 0.5               # trivially satisfied: the mask is all ocean
+crops_per_day: 8
+norm_mode: anomaly
+# DELIBERATELY EMPTY, and this is the one place the arm departs from its GOM
+# twin. data.py's climatology is an annual + semiannual harmonic; this record
+# spans 2017-01-01 to 2017-07-01, about half a year. An annual cycle is simply
+# not identifiable from half a period -- the fit would latch onto whatever
+# transient happens to be present and subtract it from the field being
+# modelled, which is the exact failure the harmonic was chosen to avoid. So
+# every variable gets a per-pixel time-mean only. Revisit if the family is
+# extended past two years; dataset_spec warns if this is set too early.
+clim_vars: []
+val_gap_days: 0
+
+# --- model ------------------------------------------------------------------
+arch: genda
+model_channels: 64
+channel_mult: [1, 2, 2, 2]    # 3 downsamples; 576x936 divides by 8 cleanly
+num_blocks: 2
+attn_resolutions: [16]
+dropout: 0.13
+
+# --- EDM --------------------------------------------------------------------
+sigma_data: 0.5
+sampler_steps: 32
+s_churn: 10.0
+s_noise: 1.0
+
+# --- optimisation ----------------------------------------------------------
+mode: diffusion
+batch: 32
+lr: 2.0e-4
+lr_schedule: constant
+warmup: 156250
+steps: 3125000
+loss_reduction: masked_mean
+grad_clip: 0.0
+grad_nan_to_num: true
+ema_halflife_kimg: 500
+num_workers: 4
+
+val_every: 10000
+val_batches: 10
+
+# --- sampling / eval --------------------------------------------------------
+k_members: 24
+n_eval_days: 0                # 0 = every valid step of the split
+
+out: /unity/f1/ozavala/DATA/JorgeVelasco/runs/prior_gulfstream

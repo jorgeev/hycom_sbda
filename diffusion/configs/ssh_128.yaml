@@ -1,0 +1,62 @@
+# Corrected SSH experiment (supersedes ssh.yaml as the reference run). Two
+# deliberate changes vs the original ssh.yaml / ssh_mse.yaml:
+#
+#   1. CONDITIONING FIX. ssh.yaml fed the model log10_grad for ALL three CHL
+#      variants (log10_grad_CHL_D, log10_grad_CHL_N, log10_grad_CHL). That is
+#      wrong: the only chlorophyll actually available to a satellite-fed model at
+#      inference is the sensed product (CHL_olci), whose gradient is log10_grad_CHL.
+#      CHL_D / CHL_N are model day/night components, not independent observables,
+#      so their gradients are non-physical extra inputs. We keep only
+#      log10_grad_CHL here (5 cond_vars -> cond_channels 73 = 5*14 + 3, vs 101).
+#   2. PATCH 128 (was 256 in ssh_256.yaml) -- the SINGLE run that disentangles
+#      training-crop context from the conditioning fix. ssh_256 changed patch AND
+#      conditioning at once; holding conditioning fixed at the 5 corrected vars and
+#      moving only patch 256->128 isolates how much of ssh_256's >150 km RMSE win
+#      was bought by the larger crop vs the conditioning fix (EXPERIMENT_LOG 17f).
+#
+# The paired MSE-UNet baseline is ssh_128_mse.yaml (same 5 cond_vars + patch 128).
+zarr_path: /unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr
+
+# --- variables (toggle any channel by editing these lists) ------------------
+target: [SSH]
+cond_vars:
+  - SSH_aviso
+  - SST_odyssea
+  - CHL_olci
+  - log10_grad_SST
+  - log10_grad_CHL         # only the satellite-sensed CHL gradient (see header)
+use_ocean_mask: true
+use_doy: true
+k_days: 14                 # sweep this to tune assimilated history
+
+# --- data / patches ---------------------------------------------------------
+patch: 128
+ocean_frac: 0.5
+crops_per_day: 8
+
+# --- optimisation -----------------------------------------------------------
+mode: diffusion
+batch: 32
+lr: 1.0e-4
+steps: 200000
+warmup: 1000
+ema_decay: 0.9999
+num_workers: 4
+
+# --- model ------------------------------------------------------------------
+model_channels: 128
+channel_mult: [1, 2, 2, 2]
+num_blocks: 2
+attn_levels: [3]
+
+# --- EDM --------------------------------------------------------------------
+sigma_data: 1.0            # data normalised to ~unit variance on ocean pixels
+sampler_steps: 32
+s_churn: 10.0              # stochastic sampler (EDM Alg. 2) for ensemble spread
+s_noise: 1.0
+
+# --- sampling / eval --------------------------------------------------------
+k_members: 16
+n_eval_days: 0             # 0 = every valid day of the split
+
+out: runs/ssh_128

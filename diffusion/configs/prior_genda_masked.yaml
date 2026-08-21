@@ -1,0 +1,72 @@
+# GenDA parity arm B -- identical to prior_genda.yaml in every respect except
+# LAND HANDLING, so the pair isolates that single choice.
+#
+# GenDA rejects any crop containing land and uses an unmasked loss (arm A). This
+# arm keeps nemo's own treatment: patches are drawn from the ocean_frac >= 0.5
+# lattice, land is zeroed in the input, and the loss is masked to ocean pixels.
+# That keeps the shelf, the Yucatan Channel and the Florida Straits in the
+# training distribution -- regions arm A never sees, but which full-frame
+# inference at 464x528 nonetheless has to reconstruct.
+#
+# Everything else (architecture, sigma_data, schedule, normalisation, budget)
+# is byte-for-byte arm A's.
+zarr_path: /unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr
+
+# --- variables ----------------------------------------------------------
+# GenDA's prior is *fully* unconditional: 7 in / 7 out, label_dim 0, no aux
+# channels of any kind. Here that means 3 in / 3 out -- no ocean mask, and no
+# day-of-year, because seasonality is removed from the data instead (norm_mode).
+target: [SSH, SST, CHL]
+cond_vars: []
+use_ocean_mask: false
+use_doy: false
+k_days: 1                     # a GenDA prior sample is one day's state
+
+# --- data / patches ------------------------------------------------------
+patch: 128
+crop_mode: grid               # ocean_frac lattice, nemo's own sampling
+reject_land: false
+ocean_frac: 0.5
+crops_per_day: 8
+norm_mode: anomaly
+clim_vars: [SST]              # seasonal climatology; SSH/CHL get a time-mean
+val_gap_days: 0               # departure: GenDA holds out a year between splits
+
+# --- model ------------------------------------------------------------------
+arch: genda
+model_channels: 64
+channel_mult: [1, 2, 2, 2]
+num_blocks: 2
+attn_resolutions: [16]        # absolute resolution, not level index
+dropout: 0.13
+
+# --- EDM --------------------------------------------------------------------
+# 0.5 is GenDA's untuned library default against ~unit-variance data; nemo's 1.0
+# is the theoretically matched value. Chosen here for strict parity -- this is a
+# deliberate call, not an oversight.
+sigma_data: 0.5
+sampler_steps: 32
+s_churn: 10.0                 # stochastic sampler for ensemble spread
+s_noise: 1.0
+
+# --- optimisation ----------------------------------------------------------
+mode: diffusion
+batch: 32                     # x2 ranks = 64 global, GenDA's batch exactly
+lr: 2.0e-4
+lr_schedule: constant         # linear warm-up then flat (GenDA lr_decay: 1)
+warmup: 156250                # 1e7 samples / 64
+steps: 3125000                # 2e8 samples / 64  (200,000 kimg)
+loss_reduction: masked_mean   # land is present in the crop, so mask it out
+grad_clip: 0.0                # GenDA does not clip
+grad_nan_to_num: true         # ... it sanitises grads instead
+ema_halflife_kimg: 500        # 0.05 ramp-up; beta saturates ~0.99991 at batch 64
+num_workers: 4
+
+val_every: 10000
+val_batches: 10
+
+# --- sampling / eval --------------------------------------------------------
+k_members: 24                 # match GenDA's 24-member ensembles
+n_eval_days: 0                # 0 = every valid day of the split
+
+out: /unity/f1/ozavala/DATA/JorgeVelasco/runs/prior_genda_masked

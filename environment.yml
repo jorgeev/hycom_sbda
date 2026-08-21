@@ -1,0 +1,17 @@
+# Minimal environment for the training core. On the COAPS cluster this is
+# already provided by the `datorch` env:
+#   source /conda/jvelasco/miniforge3/etc/profile.d/conda.sh && conda activate datorch
+#
+# Elsewhere, `conda env create -f environment.yml`. The training core needs only
+# these; xarray/cv2/pyproj/cftime are dataset-BUILDER dependencies and are
+# deliberately absent -- nothing here imports them.
+name: hycom_sbda
+channels: [conda-forge, pytorch, nvidia]
+dependencies:
+  - python>=3.11
+  - pytorch
+  - pytorch-cuda
+  - numpy
+  - zarr<3            # data.py/dataset_spec.py target the zarr v2 API
+  - numcodecs
+  - pyyaml

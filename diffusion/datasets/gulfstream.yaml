@@ -1,0 +1,82 @@
+# Gulf Stream HYCOM family: seven monthly stores (2017-01 .. 2017-07) tied
+# together by a manifest, on a 1.818 km AEQD grid of 576x936.
+#
+# Two structural differences from gom_nemo drive most of this file:
+#
+#  1. MULTIPLE STORES. The manifest lists the members in order with
+#     `global_{hour,day,week}_offset`; the loader concatenates them into one
+#     virtual axis, so a training window may straddle a month boundary.
+#  2. MULTIPLE CADENCES. Truth is hourly in `dynamic/`; the satellite-like
+#     observations are daily (`dynamic_daily/`) and weekly (`dynamic_weekly/`),
+#     each with its own time coordinate and splits file. Every variable below
+#     declares which one it lives on, and the loader maps between them by
+#     timestamp.
+name: gulfstream
+manifest: /unity/f1/ozavala/DATA/ATLc0.02_exp_04.3/datasets/gulfstream_manifest.json
+
+static_group: static
+# `ocean_mask` here is uniformly 1.0 -- this is an open-ocean box, so the builder
+# wrote no land. That is not quite true: 17 pixels (0.003% of the grid) are NaN
+# in every frame of every field, and `bathymetry` carries exactly that NaN
+# pattern. Left on `ocean_mask` alone the loss would include those pixels, whose
+# preloaded value is a hard 0 that the model is then asked to reproduce. ANDing
+# in bathymetry's finite pixels is what makes the mask honest.
+mask_var: ocean_mask
+mask_from_finite: bathymetry
+
+# Per-store `meta/` holds that MONTH's mean/std, which would normalise each month
+# by its own statistics. The manifest's `normalization` block is fit across the
+# whole family, so it is the only correct source here.
+meta_group: meta
+stats_source: manifest
+
+# The stores' own splits.json files say `val: []` (everything is train). The real
+# 80/20 boundary lives in the manifest as `splits.<cadence>_boundary`
+# (hourly 3493 of 4367).
+splits_source: manifest
+
+base_cadence: hourly
+cadences:
+  hourly:
+    dynamic_group: dynamic
+    time_path: coords/time
+    splits_file: splits.json
+    offset_key: global_hour_offset
+  daily:
+    dynamic_group: dynamic_daily
+    time_path: coords_daily/time
+    splits_file: splits_daily.json
+    offset_key: global_day_offset
+  weekly:
+    dynamic_group: dynamic_weekly
+    time_path: coords_weekly/time
+    splits_file: splits_weekly.json
+    offset_key: global_week_offset
+
+variables:
+  # --- hourly truth ---------------------------------------------------------
+  ssh:   {cadence: hourly, units: m}
+  sst:   {cadence: hourly, units: degC}
+  sss:   {cadence: hourly, units: psu}
+  u:     {cadence: hourly, units: m s-1}
+  v:     {cadence: hourly, units: m s-1}
+  ug:    {cadence: hourly, units: m s-1}
+  vg:    {cadence: hourly, units: m s-1}
+  uag:   {cadence: hourly, units: m s-1}
+  vag:   {cadence: hourly, units: m s-1}
+  tau_x: {cadence: hourly, units: N m-2}
+  tau_y: {cadence: hourly, units: N m-2}
+  # --- hourly observation-like ---------------------------------------------
+  # CAVEAT: gaps in these two are encoded as NaN *inside the array* (there is no
+  # `valid_obs` channel as in gom_nemo). Coverage is 1-18% for sst_sat and near
+  # zero for ssha_swot -- only ~4 frames in 74 carry any swath at all. The
+  # current loader maps non-finite values to 0.0, which after z-scoring reads as
+  # "the mean", so these are NOT yet usable as conditioning channels. They are
+  # declared here for completeness; see the plan's known-issues note.
+  sst_sat:            {cadence: hourly, units: degC}
+  ssha_swot:          {cadence: hourly, units: m}
+  log10_grad_sst_sat: {cadence: hourly, units: log10(degC m-1)}
+  # --- daily / weekly observation-like -------------------------------------
+  ssha_aviso:     {cadence: daily,  units: m}
+  sst_radiometer: {cadence: daily,  units: degC}
+  sss_sat:        {cadence: weekly, units: psu}

@@ -1,0 +1,19 @@
+__pycache__/
+.claude/
+.cursor/
+.vscode/
+
+# generated artifacts -- checkpoints, ensembles, caches, figures, logs
+runs/
+logs/
+*.npz
+*.pt
+*.png
+*.jpg
+*.mp4
+*.csv
+*.nc
+*.err
+*.out
+*.swp
+_norm_cache.json

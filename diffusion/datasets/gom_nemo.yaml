@@ -1,0 +1,60 @@
+# The original store, written out explicitly.
+#
+# This descriptor is the documented twin of `dataset_spec.legacy_spec()`, which
+# is what a config with no `dataset:` field resolves to. Keeping both means the
+# legacy defaults are testable rather than merely implied -- but note the two are
+# NOT interchangeable in one respect: `legacy_spec` names the dataset
+# "gom_nemo" and so keeps bare-variable cache keys, while loading this file
+# names it after the file. Both land on "gom_nemo", so the existing
+# `_norm_cache.json` / `_clim_cache.npz` entries stay valid either way.
+#
+# Every existing config (ssh*.yaml, prior_*.yaml) deliberately does NOT set
+# `dataset:` -- they resolve through `legacy_spec` and reproduce bit-identically.
+name: gom_nemo
+stores: /unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr
+
+static_group: static
+mask_var: ocean_mask          # real land here: ocean fraction 0.638
+meta_group: meta
+stats_source: meta
+splits_source: store          # splits.json holds a 1497/375 chronological split
+
+# One cadence: every channel is daily and lives in `dynamic/`.
+# NOTE: this time axis is not regular -- the NoLeap source calendar leaves 15
+# gaps (14 of 2 days, 1 of 4). Cross-cadence mapping is by timestamp precisely
+# so gaps like these never turn into silent off-by-N reads.
+base_cadence: daily
+cadences:
+  daily:
+    dynamic_group: dynamic
+    time_path: coords/time
+    splits_file: splits.json
+
+# Only variables that deviate from the defaults need listing; anything omitted
+# resolves to the base cadence with log10 taken from config.LOG10_VARS. The CHL
+# family is spelled out here because its lognormal handling is the single most
+# consequential per-variable property in this store.
+variables:
+  SSH:   {units: m}
+  SST:   {units: degC}
+  SSS:   {units: psu}
+  MLD:   {units: m}
+  CHL:       {units: mg m-3, log10: true}
+  CHL_D:     {units: mg m-3, log10: true}
+  CHL_N:     {units: mg m-3, log10: true}
+  SSH_aviso:   {units: m}
+  SST_odyssea: {units: degC}
+  CHL_olci:      {units: mg m-3, log10: true}
+  CHL_D_olci:    {units: mg m-3, log10: true}
+  CHL_N_olci:    {units: mg m-3, log10: true}
+  # Already in log space by construction -- do NOT log10 again.
+  log10_grad_SST:   {units: log10(degC m-1)}
+  log10_grad_CHL:   {units: log10(mg m-3 m-1)}
+  log10_grad_CHL_D: {units: log10(mg m-3 m-1)}
+  log10_grad_CHL_N: {units: log10(mg m-3 m-1)}
+  # Gapped family from add_cloud_gaps.py
+  SST_odyssea_gap:    {units: degC}
+  CHL_olci_gap:       {units: mg m-3, log10: true}
+  log10_grad_SST_gap: {units: log10(degC m-1)}
+  log10_grad_CHL_gap: {units: log10(mg m-3 m-1)}
+  valid_obs:          {units: "1"}
