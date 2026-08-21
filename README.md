@@ -65,6 +65,27 @@ CUDA_VISIBLE_DEVICES=1 python -m diffusion.sample \
 sbatch train.slurm diffusion/configs/prior_gulfstream.yaml 2 1,2
 ```
 
+### On AWS, in Docker
+
+```bash
+docker build -f aws/Dockerfile -t hycom_sbda .
+docker run --gpus all --ipc=host --shm-size=16g \
+  -e HYCOM_STORE=s3://my-bucket/gom_nemo_diffusive.zarr \
+  -e CONFIG=diffusion/configs/prior_genda_masked.yaml \
+  -e OUT_DIR=/mnt/runs -e CACHE_DIR=/mnt/runs/cache -v /mnt/runs:/mnt/runs \
+  -e BATCH=8 hycom_sbda
+```
+
+`--ipc=host` and `--shm-size=16g` are both required, not advisory. Read
+[`aws/README.md`](aws/README.md) before the first real run — in particular the
+**RAM sizing** note (each rank preloads the whole time axis: ~28 GB per rank for
+`prior_gulfstream`) and the **batch semantics** note (`batch` is per-GPU, and the
+GenDA-parity configs want a global batch of 64).
+
+Paths are supplied by environment variable — `HYCOM_STORE`,
+`GULFSTREAM_MANIFEST`, `OUT_DIR`, `CACHE_DIR` — each with the on-prem path as its
+fallback, so the configs above are the same files the cluster runs.
+
 `sample.py` writes `ensembles.npz` with the schema
 `{days, mask, target_vars, config, gen_<var>, truth_<var>}` — values in physical
 units. That file is the integration seam to any downstream evaluation.
@@ -131,20 +152,37 @@ diffusion/
   utils.py          DDP setup, seeding, CSV logger
   datasets/         dataset descriptors
   configs/          experiment configs
+aws/
+  Dockerfile        CUDA/torch image, deps pinned by requirements.txt
+  launch.sh         single-node DDP training launcher (replaces train.slurm)
+  sample.sh         single-GPU ensemble generation
+  common.sh         env defaults, S3 stage-in, result sync-out
+  README.md         cloud deployment guide
 ```
 
 ## Compatibility with the parent repo
 
-The eleven `diffusion/*.py` files are **byte-identical** to
-`nemo_confusion@portable-datasets`, so the two stay diffable and changes can be
-moved either way. Only `__init__.py`, this README, `train.slurm`,
-`environment.yml` and `.gitignore` are new here.
+Eight of the eleven `diffusion/*.py` files are still **byte-identical** to
+`nemo_confusion@portable-datasets`. Three diverged, to make the code runnable in
+a container on AWS; all three changes are additive and portable back upstream:
+
+| File | What changed | Why |
+|---|---|---|
+| `config.py` | `expandvars()` — `${VAR:-default}` expansion over every string in a loaded config, applied to YAML values, CLI overrides, *and* unmentioned dataclass defaults. New `storage_options` field. `norm_cache`/`clim_cache` defaults moved under `${CACHE_DIR:-diffusion}`. | One YAML has to resolve to a cluster path on-prem and an `s3://` URL in a container. Caches defaulted *into the source tree*, which a read-only image rejects. |
+| `dataset_spec.py` | `_open_store` / `_read_json` / `_join` / `_parent`: a path containing `://` is read through fsspec, anything else stays a plain directory. `storage_options` threaded through `StoreFamily` and `DatasetSpec`. Descriptor YAML env-expanded. | Lets a store live in S3 with no config change beyond the path. `_parent` exists because `os.path.abspath` mangles a URL, and the gulfstream manifest names its members *relative* to itself. |
+| `train.py` | `--config` is now required (its default named `configs/ssh.yaml`, which this copy does not ship). `sample.py` gained `--zarr-path` / `--dataset`. | A checkpoint records the store path as it resolved at training time, so sampling from another site needs to relocate it. |
+
+`data.py` needed **no** change, which is worth stating because it is the usual
+trap: fsspec's async filesystems are not fork-safe, but `_load_zscore` /
+`_load_anomaly` materialise every channel into numpy in `__init__` and `_window`
+only ever reads `self.data`, so no zarr handle survives the DataLoader fork.
 
 A config that sets no `dataset:` resolves to `dataset_spec.legacy_spec()` — the
 original single-store layout — so configs and checkpoints from the parent repo
-load and run unchanged. Verified: 20 fixed-seed steps of `ssh_128.yaml` and
-`prior_genda_masked.yaml` reproduce **bit-identically** (668 tensors across
-`model` and `ema`, max abs delta 0.0) against the pre-refactor code.
+load and run unchanged. With no env vars set, every `${VAR:-default}` resolves to
+the path that used to be hardcoded. Verified: 20 fixed-seed steps of
+`prior_genda_masked.yaml` reproduce **bit-identically** across the change (728
+tensors of `model` + `ema`, max abs delta 0.0).
 
 ## Not included
 

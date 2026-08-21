@@ -15,7 +15,7 @@
 #      was bought by the larger crop vs the conditioning fix (EXPERIMENT_LOG 17f).
 #
 # The paired MSE-UNet baseline is ssh_128_mse.yaml (same 5 cond_vars + patch 128).
-zarr_path: /unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr
+zarr_path: "${HYCOM_STORE:-/unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr}"
 
 # --- variables (toggle any channel by editing these lists) ------------------
 target: [SSH]
@@ -59,4 +59,4 @@ s_noise: 1.0
 k_members: 16
 n_eval_days: 0             # 0 = every valid day of the split
 
-out: runs/ssh_128
+out: "${OUT_DIR:-runs}/ssh_128"

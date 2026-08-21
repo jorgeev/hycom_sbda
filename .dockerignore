@@ -1,0 +1,25 @@
+.git
+.gitignore
+**/__pycache__/
+*.py[cod]
+
+# Run artifacts -- must not be baked into the image
+runs/
+logs/
+*.pt
+*.npz
+*.png
+*.jpg
+*.mp4
+*.csv
+*.nc
+*.err
+*.out
+_norm_cache.json
+_clim_cache.npz
+
+# IDE / agent scratch
+.claude/
+.cursor/
+.vscode/
+*.swp

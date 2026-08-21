@@ -10,7 +10,7 @@
 #
 # Everything else (architecture, sigma_data, schedule, normalisation, budget)
 # is byte-for-byte arm A's.
-zarr_path: /unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr
+zarr_path: "${HYCOM_STORE:-/unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr}"
 
 # --- variables ----------------------------------------------------------
 # GenDA's prior is *fully* unconditional: 7 in / 7 out, label_dim 0, no aux
@@ -69,4 +69,4 @@ val_batches: 10
 k_members: 24                 # match GenDA's 24-member ensembles
 n_eval_days: 0                # 0 = every valid day of the split
 
-out: /unity/f1/ozavala/DATA/JorgeVelasco/runs/prior_genda_masked
+out: "${OUT_DIR:-/unity/f1/ozavala/DATA/JorgeVelasco/runs}/prior_genda_masked"

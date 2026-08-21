@@ -11,7 +11,7 @@
 # Every existing config (ssh*.yaml, prior_*.yaml) deliberately does NOT set
 # `dataset:` -- they resolve through `legacy_spec` and reproduce bit-identically.
 name: gom_nemo
-stores: /unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr
+stores: "${HYCOM_STORE:-/unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr}"
 
 static_group: static
 mask_var: ocean_mask          # real land here: ocean fraction 0.638

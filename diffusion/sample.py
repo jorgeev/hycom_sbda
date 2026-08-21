@@ -101,6 +101,12 @@ def main():
                     help="number of held-out days (0 = the whole split)")
     ap.add_argument("--split", default="val", help="split to draw target days from")
     ap.add_argument("--seed", type=int, default=0)
+    # Store relocation. A checkpoint records the store path as it resolved at
+    # training time, so sampling from a different site needs an override.
+    ap.add_argument("--zarr-path", default=None,
+                    help="override the checkpoint's store path (local or s3://)")
+    ap.add_argument("--dataset", default=None,
+                    help="override the checkpoint's dataset descriptor")
     # sampler overrides (the checkpoint's config wins otherwise)
     ap.add_argument("--sampler-steps", type=int, default=None)
     ap.add_argument("--s-churn", type=float, default=None)
@@ -114,6 +120,10 @@ def main():
     ckpt = args.ckpt if args.ckpt.endswith(".pt") else os.path.join(args.ckpt, "ckpt.pt")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net, cfg = load_precond(ckpt, device)
+    if args.zarr_path:
+        cfg.zarr_path = args.zarr_path
+    if args.dataset:
+        cfg.dataset = args.dataset
     if args.k_members:
         cfg.k_members = args.k_members
     if args.sampler_steps is not None:

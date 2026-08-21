@@ -88,7 +88,10 @@ def masked_mse(pred, target, mask):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="diffusion/configs/ssh.yaml")
+    # No default: the old one named diffusion/configs/ssh.yaml, which this
+    # standalone copy does not ship -- a bare `python -m diffusion.train`
+    # died on a missing file rather than saying what was missing.
+    ap.add_argument("--config", required=True)
     ap.add_argument("--mode", default=None, choices=["diffusion", "regression"])
     ap.add_argument("--k-days", type=int, default=None)
     ap.add_argument("--patch", type=int, default=None)

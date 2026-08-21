@@ -7,6 +7,8 @@ of assimilated days ``k_days`` — is a one-line edit.
 from __future__ import annotations
 
 import dataclasses
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,7 +46,11 @@ class Config:
     # Used when ``dataset`` is unset, and back-filled from a single-store
     # descriptor so the evaluation modules (which open the store directly) keep
     # working without changes.
-    zarr_path: str = "/unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr"
+    zarr_path: str = ("${HYCOM_STORE:-/unity/f1/ozavala/DATA/GOFFISH/GOES/datasets/gom_nemo_diffusive.zarr}")
+    # Forwarded verbatim to fsspec when a store path is a URL (``s3://`` etc.);
+    # ignored for plain POSIX paths. e.g. ``{region_name: us-east-1}``, or
+    # ``{anon: true}`` for a public bucket. With an EC2 instance role, unset.
+    storage_options: dict[str, Any] | None = None
     target: list[str] = field(default_factory=lambda: ["SSH"])
     cond_vars: list[str] = field(default_factory=lambda: [
         "SSH_aviso", "SST_odyssea", "CHL_olci",
@@ -61,7 +67,11 @@ class Config:
     ocean_frac: float = 0.5              # min ocean fraction to keep a training patch
     crops_per_day: int = 8               # nominal crops per valid target day per epoch
     max_days: int | None = None          # subset the time axis (quick tests); None=all
-    norm_cache: str = "diffusion/_norm_cache.json"
+    # Written at run time, so they must NOT default into the source tree: a
+    # container image is read-only, and caches beside code are wrong even
+    # where it is writable. ${CACHE_DIR:-diffusion} keeps the on-prem
+    # location (and the existing cache files) when the var is unset.
+    norm_cache: str = "${CACHE_DIR:-diffusion}/_norm_cache.json"
     # Crop sampling. "grid" = the precomputed ocean_frac-filtered patch//4 lattice
     # (default, what every existing checkpoint trained on); "random" = GenDA's
     # uniform continuous top-left corner. ``reject_land`` (random mode only)
@@ -75,7 +85,7 @@ class Config:
     # per-variable anomaly std.
     norm_mode: str = "zscore"            # {"zscore", "anomaly"}
     clim_vars: list[str] = field(default_factory=list)
-    clim_cache: str = "diffusion/_clim_cache.npz"
+    clim_cache: str = "${CACHE_DIR:-diffusion}/_clim_cache.npz"
     val_gap_days: int = 0                # drop this many steps off the end of train
     # Reject conditioning windows that straddle a gap in the time axis. Off by
     # default, and the cost of turning it on is not small: the gom_nemo daily
@@ -169,11 +179,48 @@ class Config:
 _ALIASES = {"k_days": "k_days", "k-days": "k_days"}
 
 
+# ---------------------------------------------------------------------------
+# Environment-variable expansion
+# ---------------------------------------------------------------------------
+# Every path in a shipped config is written as ``${VAR:-<the on-prem path>}``,
+# so one YAML runs unchanged on the COAPS cluster (no env vars set -> the
+# fallback, i.e. exactly the path that used to be hardcoded) and inside a
+# container on AWS (export the var -> an s3:// URL or a bind-mounted path).
+# Ported from the sibling nemo_anfo project, which uses the same convention.
+_VAR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)\}")
+
+
+def _expand_str(s: str) -> str:
+    # Resolve the ``${VAR:-default}`` form first, then plain ``$VAR`` /
+    # ``${VAR}``. ``os.environ.get(...) or default`` (rather than a plain get)
+    # means an env var set to the empty string also falls back -- an empty
+    # HYCOM_STORE is a mistake, never a request to read the current directory.
+    s = _VAR_DEFAULT.sub(lambda m: os.environ.get(m.group(1)) or m.group(2), s)
+    return os.path.expandvars(s)
+
+
+def expandvars(obj):
+    """Recursively expand env vars in every string of a loaded config tree.
+
+    Supports ``$VAR``, ``${VAR}`` and ``${VAR:-default}``. Used on both
+    experiment configs (here) and dataset descriptors (``dataset_spec``).
+    """
+    if isinstance(obj, str):
+        return _expand_str(obj)
+    if isinstance(obj, list):
+        return [expandvars(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: expandvars(v) for k, v in obj.items()}
+    return obj
+
+
 def load_config(path: str | None = None, **overrides) -> Config:
     """Build a Config from an optional YAML file plus keyword overrides.
 
     Only keys present in ``Config`` are accepted; ``None`` overrides are ignored
-    so CLI flags that default to ``None`` don't clobber YAML values.
+    so CLI flags that default to ``None`` don't clobber YAML values. Every
+    string value is env-var-expanded (see :func:`expandvars`), which is what
+    keeps one config portable between the cluster and a container.
     """
     data: dict[str, Any] = {}
     if path:
@@ -184,8 +231,24 @@ def load_config(path: str | None = None, **overrides) -> Config:
             continue
         data[_ALIASES.get(k, k)] = v
 
+    # After the overrides, so a `--out '${OUT_DIR:-runs}/x'` on the command line
+    # expands the same way a YAML value does.
+    data = expandvars(data)
+
     valid = {f.name for f in dataclasses.fields(Config)}
     unknown = set(data) - valid
     if unknown:
         raise ValueError(f"Unknown config keys: {sorted(unknown)}")
-    return Config(**data)
+    cfg = Config(**data)
+
+    # Dataclass defaults never went through the loop above, so expand the ones
+    # the config did not override. Without this a ${VAR:-default} default (e.g.
+    # norm_cache) would reach the filesystem verbatim, as a literal directory
+    # named "${CACHE_DIR:-diffusion}".
+    for f in dataclasses.fields(cfg):
+        if f.name in data:
+            continue
+        v = getattr(cfg, f.name)
+        if isinstance(v, str):
+            setattr(cfg, f.name, _expand_str(v))
+    return cfg

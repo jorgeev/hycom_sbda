@@ -71,4 +71,4 @@ val_batches: 10
 k_members: 24
 n_eval_days: 0                # 0 = every valid step of the split
 
-out: /unity/f1/ozavala/DATA/JorgeVelasco/runs/prior_gulfstream
+out: "${OUT_DIR:-/unity/f1/ozavala/DATA/JorgeVelasco/runs}/prior_gulfstream"

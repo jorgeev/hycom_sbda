@@ -38,6 +38,86 @@ import zarr
 
 
 # ---------------------------------------------------------------------------
+# Storage access: local POSIX, or any fsspec URL (s3://, gs://, file://)
+# ---------------------------------------------------------------------------
+# A path containing "://" is read through fsspec; anything else is a plain
+# directory. That one sniff is the whole local-vs-cloud switch, so an on-prem
+# store and an S3 store differ by nothing but the path. ``storage_options``
+# (e.g. ``{"region_name": "us-east-1"}`` or ``{"anon": True}``) is forwarded to
+# the backend; with an EC2 instance role, none are needed.
+#
+# fsspec is imported lazily inside each branch: a POSIX-only run -- which is
+# every run on the cluster -- never needs it installed.
+
+
+def _is_url(path) -> bool:
+    return "://" in str(path)
+
+
+def _join(base: str, name: str) -> str:
+    """Join ``name`` onto ``base``, for a URL or a POSIX path alike."""
+    return f"{str(base).rstrip('/')}/{name.lstrip('/')}"
+
+
+def _parent(path: str) -> str:
+    """Directory containing ``path``, for a URL or a POSIX path alike.
+
+    Used for the manifest root. ``os.path.abspath`` cannot be used here: on an
+    ``s3://`` URL it prepends the CWD and the member store paths -- which the
+    manifest stores *relative* -- would silently resolve to nonsense.
+    """
+    if _is_url(path):
+        return str(path).rstrip("/").rsplit("/", 1)[0]
+    return os.path.dirname(os.path.abspath(path))
+
+
+def _open_store(path, storage_options: dict | None = None):
+    """Open a zarr store from a local path or an fsspec URL."""
+    # zarr's own PathNotFoundError names the sub-path *inside* the store (''),
+    # never the store location, which makes a wrong env var or a forgotten
+    # bind-mount close to undiagnosable. Fail with the actual path instead.
+    if _is_url(path):
+        import fsspec
+        try:
+            return zarr.open(fsspec.get_mapper(str(path), **(storage_options or {})),
+                             mode="r")
+        except Exception as exc:
+            raise FileNotFoundError(
+                f"could not open remote zarr store {path!r} "
+                f"(storage_options={storage_options!r}): {exc}"
+            ) from exc
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"zarr store not found: {path!r} (cwd={os.getcwd()!r}). In Docker, "
+            "check the store is bind-mounted into the container, or point the "
+            "store env var (HYCOM_STORE / GULFSTREAM_MANIFEST) at an s3:// URL."
+        )
+    try:
+        return zarr.open(path, mode="r")
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"{path!r} exists but is not a readable zarr group "
+            "(no .zgroup/.zarray at its root?): " + str(exc)
+        ) from exc
+
+
+def _read_json(path, storage_options: dict | None = None):
+    """Read + parse a JSON file from a local path or an fsspec URL."""
+    if _is_url(path):
+        import fsspec
+        with fsspec.open(str(path), "r", **(storage_options or {})) as fh:
+            return json.load(fh)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"{path!r} not found -- splits sidecars are read from inside the "
+            "store directory and the manifest from beside its member stores; "
+            "stage them together, not just the arrays."
+        )
+    with open(path) as fh:
+        return json.load(fh)
+
+
+# ---------------------------------------------------------------------------
 # Descriptor pieces
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -69,11 +149,12 @@ class StoreFamily:
     stays one ``zarr`` call deep and its performance is unchanged.
     """
 
-    def __init__(self, paths: list[str]):
+    def __init__(self, paths: list[str], storage_options: dict | None = None):
         if not paths:
             raise ValueError("StoreFamily needs at least one store path")
         self.paths = list(paths)
-        self.stores = [zarr.open(p, mode="r") for p in self.paths]
+        self.storage_options = storage_options
+        self.stores = [_open_store(p, storage_options) for p in self.paths]
         self._times: dict[str, np.ndarray] = {}
         self._bounds: dict[str, np.ndarray] = {}
 
@@ -177,9 +258,7 @@ class StoreFamily:
 
     def sidecar(self, filename: str) -> Any:
         """Read a JSON sidecar from the *first* member store."""
-        p = os.path.join(self.paths[0], filename)
-        with open(p) as f:
-            return json.load(f)
+        return _read_json(_join(self.paths[0], filename), self.storage_options)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +282,7 @@ class DatasetSpec:
     stats_source: str = "meta"          # {"meta", "manifest", "compute"}
     splits_source: str = "store"        # {"store", "manifest"}
     log10_vars: frozenset[str] = frozenset()
+    storage_options: dict | None = None   # forwarded to fsspec for s3:// stores
     _family: StoreFamily | None = field(default=None, repr=False, compare=False)
     _maps: dict[str, np.ndarray] = field(default_factory=dict, repr=False, compare=False)
 
@@ -210,7 +290,7 @@ class DatasetSpec:
     @property
     def family(self) -> StoreFamily:
         if self._family is None:
-            self._family = StoreFamily(self.stores)
+            self._family = StoreFamily(self.stores, self.storage_options)
         return self._family
 
     @property
@@ -350,8 +430,7 @@ class DatasetSpec:
         b = fam.bounds(cad)
         out: dict[str, list[int]] = {}
         for i, p in enumerate(fam.paths):
-            with open(os.path.join(p, cad.splits_file)) as f:
-                s = json.load(f)
+            s = _read_json(_join(p, cad.splits_file), self.storage_options)
             for k, v in s.items():
                 if isinstance(v, list):
                     out.setdefault(k, []).extend(int(j) + int(b[i]) for j in v)
@@ -457,7 +536,8 @@ _LEGACY_CADENCE = CadenceSpec(name="daily", dynamic_group="dynamic",
                               time_path="coords/time", splits_file="splits.json")
 
 
-def legacy_spec(zarr_path: str, log10_vars: frozenset[str] = frozenset()) -> DatasetSpec:
+def legacy_spec(zarr_path: str, log10_vars: frozenset[str] = frozenset(),
+                storage_options: dict | None = None) -> DatasetSpec:
     """The pre-refactor assumptions, expressed as a spec.
 
     Used whenever a config sets no ``dataset``, so every existing experiment and
@@ -475,29 +555,36 @@ def legacy_spec(zarr_path: str, log10_vars: frozenset[str] = frozenset()) -> Dat
         stats_source="meta",
         splits_source="store",
         log10_vars=log10_vars,
+        storage_options=storage_options,
     )
 
 
-def load_dataset_spec(path: str, *, log10_vars: frozenset[str] = frozenset()
-                      ) -> DatasetSpec:
-    """Build a :class:`DatasetSpec` from a descriptor YAML."""
+def load_dataset_spec(path: str, *, log10_vars: frozenset[str] = frozenset(),
+                      storage_options: dict | None = None) -> DatasetSpec:
+    """Build a :class:`DatasetSpec` from a descriptor YAML.
+
+    Every string in the descriptor is env-var-expanded, so ``stores:`` and
+    ``manifest:`` can be written ``${VAR:-<on-prem path>}`` and point at an
+    s3:// URL in a container without a second copy of the file.
+    """
+    from .config import expandvars
     with open(path) as f:
-        d = yaml.safe_load(f) or {}
+        d = expandvars(yaml.safe_load(f) or {})
 
     manifest = None
     stores: list[str] = []
     if d.get("manifest"):
         mpath = d["manifest"]
-        with open(mpath) as f:
-            manifest = json.load(f)
-        root = os.path.dirname(os.path.abspath(mpath))
+        manifest = _read_json(mpath, storage_options)
+        root = _parent(mpath)
         # Member order is the manifest's key order, which the builder writes in
         # chronological order; sorting the keys makes that explicit rather than
         # relying on dict insertion order surviving the JSON round-trip.
         for key in sorted(manifest.get("stores", {})):
             entry = manifest["stores"][key]
             p = entry["path"] if isinstance(entry, dict) else entry
-            stores.append(p if os.path.isabs(p) else os.path.join(root, p))
+            absolute = _is_url(p) or os.path.isabs(p)
+            stores.append(p if absolute else _join(root, p))
     if d.get("stores"):
         raw = d["stores"]
         stores = [raw] if isinstance(raw, str) else list(raw)
@@ -534,6 +621,7 @@ def load_dataset_spec(path: str, *, log10_vars: frozenset[str] = frozenset()
         stats_source=d.get("stats_source", "meta"),
         splits_source=d.get("splits_source", "store"),
         log10_vars=log10_vars,
+        storage_options=storage_options,
     )
 
 
@@ -566,12 +654,14 @@ def resolve_spec(cfg) -> DatasetSpec:
     untouched for every single-store dataset.
     """
     from .config import LOG10_VARS
+    so = getattr(cfg, "storage_options", None) or None
     if getattr(cfg, "dataset", None):
-        spec = load_dataset_spec(_find_descriptor(cfg.dataset), log10_vars=LOG10_VARS)
+        spec = load_dataset_spec(_find_descriptor(cfg.dataset),
+                                 log10_vars=LOG10_VARS, storage_options=so)
         if len(spec.stores) == 1:
             cfg.zarr_path = spec.stores[0]
     else:
-        spec = legacy_spec(cfg.zarr_path, log10_vars=LOG10_VARS)
+        spec = legacy_spec(cfg.zarr_path, log10_vars=LOG10_VARS, storage_options=so)
     return spec
 
 

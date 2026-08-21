@@ -12,7 +12,7 @@
 #     declares which one it lives on, and the loader maps between them by
 #     timestamp.
 name: gulfstream
-manifest: /unity/f1/ozavala/DATA/ATLc0.02_exp_04.3/datasets/gulfstream_manifest.json
+manifest: "${GULFSTREAM_MANIFEST:-/unity/f1/ozavala/DATA/ATLc0.02_exp_04.3/datasets/gulfstream_manifest.json}"
 
 static_group: static
 # `ocean_mask` here is uniformly 1.0 -- this is an open-ocean box, so the builder
