@@ -66,6 +66,12 @@ uses the domain-mean latitude (35.0 °N) and domain-mean climatology for *both*
 generated and real patches. The comparison stays fair; the absolute EKE in patch
 mode is not a physical measurement. Read full-frame EKE for that.
 
+A *real* patch, however, is somewhere — and that matters for its land. Each
+sample npz stores the real crop corners (`real_pos`) and the full-domain ocean
+mask (`mask_full`) so `diagnostics.py` can rebuild each real patch's own land
+mask before taking any spatial derivative. See the land-edge EKE gotcha below
+for what happens without it.
+
 ## Files
 
 | file | what |
@@ -123,6 +129,39 @@ seven trained channels and are free ground truth. Current numbers:
   them to 0.0, and `np.gradient` smears each into its neighbours — enough to set
   the colour scale of an EKE map. Anything involving a derivative uses
   `kernels.erode_mask`.
+- **Land inside a real patch is a trap for derivatives** (bug found in the
+  step-1,140,000 patch eval, fixed 2026-08-24). Land pixels hold anomaly
+  `== 0.0` exactly, so where a real 128×128 crop contains coastline,
+  `np.gradient` sees an ocean→land step of ~0.2 m of ssh over one cell and
+  `geostrophic_uv` turns it into O(10) m/s of spurious velocity — up to
+  **425 m²/s² of "EKE"** at a small island near full-grid (115, 218), vs ~1
+  for a real eddy. Because patch crops come from the training loader's
+  stride-32 lattice (`crop_mode: grid`, stride = patch//4), that one island
+  landed at the same few patch-relative offsets in every sample, and the
+  sample-mean map in `fig4_eke.png` showed it as a *regular grid of identical
+  bright comma-shaped blobs* — easy to misread as a model or data defect. The
+  full-frame figures never showed it because full mode stores the true ocean
+  mask and `grad_mask` erodes it; patch mode stores `mask = ones` (a generated
+  patch is nowhere, point 3 above), which silently threw away the *real*
+  patches' geography too.
+
+  The fix: `gen_prior.py` now stores `mask_full` in every npz, and
+  `diagnostics.py` builds a per-sample eroded mask for the real side of
+  `fig4_eke` and the geostrophy panel of `fig5_crosschannel`. Effect on the
+  step-1,140,000 numbers: real patch EKE was inflated ~4 % (26 of 512 crops
+  contain land), so the total-EKE ratio moved x0.59 → x0.61 — the maps were
+  badly polluted but the scalar conclusion stood. A pre-fix patch npz can be
+  backfilled without repaying the store load, using the full-geometry npz
+  written alongside it:
+
+  ```bash
+  python - <<'EOF'
+  import numpy as np
+  d = dict(np.load("eval_stepNNN/samples_128.npz", allow_pickle=False))
+  d["mask_full"] = np.load("eval_stepNNN/samples_full.npz")["mask"]
+  np.savez("eval_stepNNN/samples_128.npz", **d)
+  EOF
+  ```
 
 ## Comparing checkpoints
 

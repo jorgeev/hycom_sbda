@@ -88,6 +88,31 @@ class Samples:
         self.n, self.c, self.ny, self.nx = self.gen_a.shape
         # eroded mask for anything involving a spatial derivative
         self.grad_mask = K.erode_mask(self.mask, 2)
+        # Per-sample equivalent for the REAL side. In patch mode ``mask`` is
+        # all ones (a generated patch is nowhere, see gen_prior), but each REAL
+        # patch was cropped somewhere: land pixels inside it hold anomaly ==
+        # 0.0 exactly, and np.gradient across that ocean->land step yields
+        # O(10) m/s spurious geostrophic velocity, O(100) m2/s2 EKE. Worse, the
+        # stride-32 crop lattice puts the same island at the same few patch
+        # offsets in every sample, so the sample-mean EKE map showed it as a
+        # regular grid of bright blobs (see the land-edge EKE gotcha in
+        # eval/README.md). Rebuild each real patch's eroded ocean mask from its
+        # crop corner and the full-domain mask.
+        pos = d["real_pos"]
+        full = d["mask_full"] if "mask_full" in d.files else np.zeros((0, 0))
+        if pos.size and full.size:
+            rgm = np.empty((self.n, self.ny, self.nx), dtype=bool)
+            for i, (y0, x0) in enumerate(np.asarray(pos, dtype=int)):
+                rgm[i] = K.erode_mask(full[y0:y0 + self.ny, x0:x0 + self.nx], 2)
+            self.real_grad_mask = rgm & self.grad_mask
+        else:
+            if pos.size:
+                print("[diag] WARNING: patch npz predates mask_full -- real "
+                      "patches cannot be land-masked and derivative-based "
+                      "figures will show land-edge artifacts. Backfill recipe "
+                      "in eval/README.md.")
+            self.real_grad_mask = np.broadcast_to(
+                self.grad_mask, (self.n, self.ny, self.nx))
 
     def anom(self, which: str, v: str) -> np.ndarray:
         """(N, H, W) anomaly in PHYSICAL units (sigma * std), no climatology."""
@@ -389,8 +414,14 @@ def fig_eke(S: Samples, out: str) -> dict:
     is already eddy kinetic energy -- using the denormalised field instead would
     fold in the mean Gulf Stream jet. The ageostrophic part comes straight from
     the generated uag/vag channels, which are anomalies by construction.
+
+    The two sides are masked differently on purpose: the generated side uses the
+    shared ``grad_mask`` (its land, if any, is wherever the model drew it), the
+    real side uses ``real_grad_mask`` so each patch's own land edges never meet
+    np.gradient. In full geometry the two masks coincide.
     """
     m = S.grad_mask
+    rm = S.real_grad_mask                                 # (N, H, W)
     res = {}
     fields = {}
     for which in ("gen", "real"):
@@ -398,15 +429,22 @@ def fig_eke(S: Samples, out: str) -> dict:
         fields[which] = {"geostrophic": K.eke(*geo), "ageostrophic": K.eke(*ageo),
                          "total": K.eke(*tot)}
         for part, arr in fields[which].items():
-            res[f"eke_{part}_{which}"] = float(np.nanmean(arr[:, m]))
+            sel = arr[rm] if which == "real" else arr[:, m]
+            res[f"eke_{part}_{which}"] = float(np.nanmean(sel))
     for part in ("geostrophic", "ageostrophic", "total"):
         res[f"eke_{part}_ratio"] = res[f"eke_{part}_gen"] / res[f"eke_{part}_real"]
 
-    # Average over samples FIRST, then mask. Masking first would leave every
-    # masked pixel as a column of all-NaN, and averaging that is a mean of an
-    # empty slice -- same numbers, but a screenful of warnings.
+    # Generated side: average over samples FIRST, then mask. Masking first
+    # would leave every masked pixel as a column of all-NaN, and averaging that
+    # is a mean of an empty slice -- same numbers, but a screenful of warnings.
     gmap = _masked(fields["gen"]["total"].mean(0), m)
-    rmap = _masked(fields["real"]["total"].mean(0), m)
+    # Real side: each sample has its own mask, so a plain mean(0) is exactly
+    # the bug this masking exists to fix. Sum/count keeps a pixel's mean over
+    # the samples where it is valid ocean and divides all-masked pixels to NaN
+    # without an empty-slice warning.
+    cnt = rm.sum(0)
+    rsum = np.where(rm, fields["real"]["total"], 0.0).sum(0)
+    rmap = np.where(cnt > 0, rsum / np.maximum(cnt, 1), np.nan)
     vmax = float(np.nanpercentile(rmap, 99))
 
     fig, axes = plt.subplots(2, 3, figsize=(16.5, 8.2))
@@ -450,8 +488,11 @@ def fig_eke(S: Samples, out: str) -> dict:
     ax.tick_params(labelsize=7)
 
     ax = axes[1][1]
-    per_sample = {w: np.nanmean(fields[w]["total"][:, m], axis=1)
-                  for w in ("real", "gen")}
+    per_sample = {
+        "gen": np.nanmean(fields["gen"]["total"][:, m], axis=1),
+        "real": (np.where(rm, fields["real"]["total"], 0.0).sum((1, 2))
+                 / np.maximum(rm.sum((1, 2)), 1)),
+    }
     # Shared bin edges: per-series bins would put the two histograms on
     # different grids and make an eyeball comparison meaningless.
     allv = np.concatenate(list(per_sample.values()))
@@ -526,7 +567,12 @@ def fig_crosschannel(S: Samples, out: str) -> dict:
     pts = {}
     for which in ("real", "gen"):
         geo, ageo, _ = _velocities(S, which)
-        x, y = geo[0][:, m].ravel(), ageo[0][:, m].ravel()
+        # Real patches carry their own land (see Samples.real_grad_mask); a
+        # generated patch has none, so the shared eroded mask is right for it.
+        if which == "real":
+            x, y = geo[0][S.real_grad_mask], ageo[0][S.real_grad_mask]
+        else:
+            x, y = geo[0][:, m].ravel(), ageo[0][:, m].ravel()
         keep = np.isfinite(x) & np.isfinite(y)
         pts[which] = (x[keep], y[keep])
     # One range for both panels, or the two clouds cannot be compared by eye.

@@ -273,6 +273,13 @@ def _denorm_reference(ds, cfg, lat_full, full, hw, ref_day):
     # to give it. Use the domain mean for BOTH sides: the comparison stays fair,
     # which is what matters, at the cost of the real patches not sitting at their
     # own latitude.
+    #
+    # The all-ones ``mask`` this returns is right for the GENERATED side only.
+    # A REAL crop can contain land, and land pixels hold anomaly == 0.0 exactly,
+    # so anything that differentiates a real patch must know where its land is.
+    # ``run_size`` therefore stores the full-domain ocean mask as ``mask_full``
+    # next to ``real_pos``; diagnostics rebuilds a per-sample mask from the two
+    # (see the land-edge EKE gotcha in eval/README.md).
     ocean_b = ds.ocean > 0.5
     clim_ref = np.stack([np.full(hw, float(c[ocean_b].mean()), dtype=np.float32)
                          for c in clim], 0)
@@ -303,10 +310,21 @@ def _load_real_cache(path: str, size: str, n: int, target) -> dict:
     print(f"[real] reused {n} of {real.shape[0]} fields from {src} "
           f"(split={meta['split']}, ref_day={int(d['ref_day'])})")
     pos = d["real_pos"]
+    # Caches written before the land-edge EKE fix have no mask_full. A
+    # zero-size array keeps the payload savez-able and lets diagnostics detect
+    # the gap and warn, instead of this loader refusing an otherwise-good cache.
+    if "mask_full" in d.files:
+        mask_full = d["mask_full"]
+    else:
+        mask_full = np.zeros((0, 0), dtype=np.float32)
+        if pos.size:
+            print(f"[real] WARNING: {src} predates mask_full: real patches "
+                  "cannot be land-masked downstream (see the land-edge EKE "
+                  "gotcha in eval/README.md, including the backfill recipe)")
     return dict(real=real[:n], pos=pos[:n].tolist() if pos.size else [],
                 days=d["real_days"][:n], ref_day=int(d["ref_day"]),
-                hw=real.shape[2:], mask=d["mask"], lat=d["lat"],
-                clim_ref=d["clim_ref"], std=d["std"],
+                hw=real.shape[2:], mask=d["mask"], mask_full=mask_full,
+                lat=d["lat"], clim_ref=d["clim_ref"], std=d["std"],
                 lat_note=meta.get("lat_note", "from --real-from cache"))
 
 
@@ -320,7 +338,7 @@ def run_size(net, cfg, ds, lat_full, dx_m, size, n, batch, device, args,
         ref = _load_real_cache(args.real_from, size, n, cfg.target)
         real, pos, days, ref_day = ref["real"], ref["pos"], ref["days"], ref["ref_day"]
         hw, mask, lat, clim_ref = ref["hw"], ref["mask"], ref["lat"], ref["clim_ref"]
-        std, lat_note = ref["std"], ref["lat_note"]
+        std, lat_note, mask_full = ref["std"], ref["lat_note"], ref["mask_full"]
     else:
         days = pick_real_days(ds.valid_days, n, args.skip_tail, allow_repeat=not full)
         ref_day = (int(args.ref_day) if args.ref_day is not None
@@ -344,6 +362,10 @@ def run_size(net, cfg, ds, lat_full, dx_m, size, n, batch, device, args,
         real = np.stack(real, 0).astype(np.float32)
         hw, mask, lat, clim_ref, std, lat_note = _denorm_reference(
             ds, cfg, lat_full, full, hw, ref_day)
+        # Stored in BOTH geometries (identical to ``mask`` in full mode) so a
+        # patch npz is self-contained: real_pos + mask_full is what lets
+        # diagnostics mask the land inside each real crop before differentiating.
+        mask_full = (ds.ocean > 0.5).astype(np.float32)
     print(f"[real] {real.shape}")
 
     # -- generated samples --------------------------------------------------
@@ -357,7 +379,7 @@ def run_size(net, cfg, ds, lat_full, dx_m, size, n, batch, device, args,
 
     payload = dict(
         vars=json.dumps(list(cfg.target)), gen_norm=gen, real_norm=real,
-        clim_ref=clim_ref, std=std, mask=mask, lat=lat,
+        clim_ref=clim_ref, std=std, mask=mask, mask_full=mask_full, lat=lat,
         dx_m=np.float64(dx_m), real_days=days.astype(np.int64),
         real_pos=np.asarray(pos, dtype=np.int64) if pos else np.zeros((0, 2), np.int64),
         ref_day=np.int64(ref_day), size=size,
