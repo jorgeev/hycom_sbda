@@ -17,3 +17,4 @@ logs/
 *.out
 *.swp
 _norm_cache.json
+runs

@@ -123,12 +123,17 @@ Descriptor keys:
    base cadence, not days.** On gulfstream (`base_cadence: hourly`) they are
    hours. The names are kept only because every saved checkpoint carries them in
    its config dict.
-2. **`norm_mode: anomaly` with non-empty `clim_vars` needs ~2 years of record.**
-   It fits an annual + semiannual harmonic, which is not identifiable from a
-   shorter one — the fit latches onto whatever transient is present and
-   subtracts it from the signal you are trying to model. `dataset_spec` warns;
-   use `clim_vars: []` (per-pixel time-mean) instead. Gulfstream spans ~6 months,
-   so `prior_gulfstream.yaml` sets it empty.
+2. **`norm_mode: anomaly` with non-empty `clim_vars` needs ~2 years of record —
+   in the default `clim_mode: harmonic`.** That basis is an annual + semiannual
+   harmonic, which is not identifiable from a shorter record; the fit latches
+   onto whatever transient is present and subtracts it from the signal you are
+   trying to model. `dataset_spec` warns. Either drop the variable from
+   `clim_vars` (an omitted variable gets a plain per-pixel time-mean) or switch
+   to `clim_mode: monthly`, twelve per-pixel values interpolated smoothly in
+   day-of-year, which has no such requirement. Gulfstream spans ~6 months, so
+   `prior_gulfstream.yaml` takes the second route: `clim_vars: [sst, sss]` with
+   `clim_mode: monthly`, because those two carry a seasonal cycle (84 % and 45 %
+   of their per-pixel variance) that would otherwise dominate the prior.
 3. **Check your mask is real.** Gulfstream's `ocean_mask` is uniformly 1.0, but
    17 pixels are NaN in every frame of every field; `bathymetry` carries exactly
    that pattern, hence `mask_from_finite: bathymetry`. Without it those pixels
@@ -152,6 +157,11 @@ diffusion/
   utils.py          DDP setup, seeding, CSV logger
   datasets/         dataset descriptors
   configs/          experiment configs
+eval/
+  kernels.py        radial PSD, geostrophy, EKE, moments -- with --selftest
+  gen_prior.py      unconditional draws + matched real fields -> samples_*.npz
+  diagnostics.py    samples_*.npz -> gallery, spectra, PDFs, EKE, cross-channel
+  README.md         unit conventions and how to read each figure
 aws/
   Dockerfile        CUDA/torch image, deps pinned by requirements.txt
   launch.sh         single-node DDP training launcher (replaces train.slurm)
@@ -184,11 +194,32 @@ the path that used to be hardcoded. Verified: 20 fixed-seed steps of
 `prior_genda_masked.yaml` reproduce **bit-identically** across the change (728
 tensors of `model` + `ema`, max abs delta 0.0).
 
+## Evaluating a trained prior
+
+`eval/` answers "what has this prior learned" from **unconstrained** draws — no
+conditioning, no observations, no assimilation. It is deliberately outside
+`diffusion/`, which stays a pure training core with no plotting dependencies, and
+nothing in `diffusion/` imports from it.
+
+```bash
+python -m eval.kernels --selftest          # gates everything below
+CUDA_VISIBLE_DEVICES=1 python -m eval.gen_prior --ckpt <run>/best.pt --out-dir <run>/eval
+python -m eval.diagnostics --samples <run>/eval/samples_full.npz --out <run>/eval/figs_full
+# or: sbatch eval.slurm <run>/best.pt
+```
+
+Five figures — sample gallery, radial spectra, marginal PDFs, eddy kinetic
+energy, and cross-channel correlation — plus `summary.csv` and a `report.md`.
+Read [`eval/README.md`](eval/README.md) first: the anomaly-vs-physical unit
+convention is load-bearing, and so is the reason patch-mode EKE is not a physical
+measurement.
+
 ## Not included
 
-The parent repo's evaluation and diagnostics stack — `evaluate.py`, `metrics.py`,
-`gate.py`, `baselines.py`, `eddies.py`, `seasonal.py`, `animate.py` — and the
-assimilation layer `obs_operator.py` / `assimilate.py`. All of those are still
+The parent repo's *conditional* evaluation and assimilation stack —
+`evaluate.py`, `metrics.py`, `gate.py`, `baselines.py`, `eddies.py`,
+`seasonal.py`, `animate.py`, `obs_operator.py`, `assimilate.py`. Those are still
 coupled to Gulf-of-Mexico variable names and SSH-specific physics (geostrophy at
-a hardcoded latitude, Okubo-Weiss, AVISO cutoffs). Porting them is a separate
-pass; until then, run them from the parent repo against `ensembles.npz`.
+a hardcoded latitude, Okubo-Weiss, AVISO cutoffs) and they evaluate ensembles
+against truth, which `eval/` does not attempt. Porting them is a separate pass;
+until then, run them from the parent repo against `ensembles.npz`.
