@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -37,9 +38,27 @@ def save_ckpt(state, path):
     checkpoint intact instead of truncating it to 0 bytes. os.replace is atomic
     within a filesystem, so a reader never sees a half-written ckpt.pt.
     """
+    # Retry transient storage errors. /unity/f1 returned EIO twice on
+    # 2026-08-22; an exception here would discard hours of GPU time for a file
+    # that will be rewritten in ckpt_every steps anyway. After the last attempt
+    # give up with a warning rather than raising -- the previous checkpoint is
+    # still intact (os.replace is atomic), so the run stays resumable.
     tmp = path + ".tmp"
-    torch.save(state, tmp)
-    os.replace(tmp, path)
+    for attempt in range(4):
+        try:
+            torch.save(state, tmp)
+            os.replace(tmp, path)
+            return
+        except OSError as e:
+            if attempt == 3:
+                print(f"[ckpt] WARNING: failed to write {path} after 4 attempts: "
+                      f"{type(e).__name__}: {e} -- continuing", flush=True)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                return
+            time.sleep(2.0 * (2 ** attempt))
 
 
 def build_net(cfg, mode: str):

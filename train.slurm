@@ -10,11 +10,12 @@
 #SBATCH --time=3-00:00:00
 #
 # Usage: sbatch train.slurm <config> [nranks] [gpu-list]
-#   sbatch --gres=gpu:a100:2 --time=2-12:00:00 \
-#       train.slurm diffusion/configs/prior_gulfstream.yaml 2
+#   sbatch --gres=gpu:a100:3 --time=2-12:00:00 \
+#       train.slurm diffusion/configs/prior_gulfstream.yaml 2 2,3
 #
-# Leave [gpu-list] unset under SLURM -- it grants the GPUs and exports the
-# right CUDA_VISIBLE_DEVICES itself. Match --gres to <nranks>.
+# ON THE COAPS NODE, ALWAYS PASS [gpu-list] EXPLICITLY. SLURM's own
+# CUDA_VISIBLE_DEVICES is wrong here -- see the block below. Request
+# --gres=gpu:a100:3 (the whole pool) and select the physical GPUs by hand.
 #
 # The GenDA-parity configs want a 64-sample GLOBAL batch, which 3 ranks cannot
 # split evenly -- run those as 2 ranks x batch 32.
@@ -22,21 +23,35 @@
 source /conda/jvelasco/miniforge3/etc/profile.d/conda.sh
 conda activate datorch
 
-# GPU selection. Prefer SLURM's own allocation: gres.conf on the COAPS node
-# declares only /dev/nvidia{1,2,3}, so the externally-held physical GPU 0 is
-# already outside the pool and SLURM sets CUDA_VISIBLE_DEVICES to a correct
-# 0-based list within whatever it granted (e.g. "0,1" for --gres=gpu:a100:2).
+# GPU selection. SITE-SPECIFIC and load-bearing: on the COAPS node SLURM's
+# exported CUDA_VISIBLE_DEVICES does NOT identify the GPUs it granted, so
+# trusting it puts a rank on the externally-held GPU 0 and OOMs.
 #
-# This used to hardcode `export CUDA_VISIBLE_DEVICES="${3:-1,2,3}"` against a
-# time when gres did not isolate. That is now wrong and fails loudly: the value
-# indexes *into* the set SLURM already restricted, so on a 2-GPU allocation
-# ordinal "3" does not exist and rank 1 dies with "invalid device ordinal"
-# while rank 0 comes up fine. Only override when a list is passed explicitly,
-# and note those ordinals are allocation-relative, not physical.
+# Measured 2026-08-21 with probe jobs (slurm 24.05.2, ConstrainDevices=yes,
+# cgroup v2). gres.conf declares /dev/nvidia{1,2,3}; physical GPU 0 is held by
+# an external vLLM process using ~79 of 80 GB. Identifying cards by UUID:
+#
+#   --gres=gpu:a100:2 -> SLURM grants slots 0,1 (= /dev/nvidia1,2) and exports
+#       CUDA_VISIBLE_DEVICES=0,1. But the process actually sees physical
+#       {0,1,3} -- GPU 0 leaks in and granted nvidia2 is missing. Ordinals 0,1
+#       therefore land on physical 0 and 1: rank 0 gets the vLLM card with
+#       1.7 GB free. This is what happened to job 2329.
+#   --gres=gpu:a100:3 -> all four devices visible and enumeration matches
+#       physical order, so an explicit list means what it says.
+#
+# Hence: take the whole pool and pin by hand. The ordinals below are PHYSICAL
+# only because of that 3-GPU grant; under a partial grant they are scrambled.
+#
+# (The earlier revision of this comment claimed gres isolated properly and told
+# you to leave the list unset. That was wrong and cost a job.)
 if [[ -n "${3:-}" ]]; then
     export CUDA_VISIBLE_DEVICES="$3"
+elif [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    echo "[gpu] WARNING: no gpu-list passed under SLURM. On the COAPS node" >&2
+    echo "[gpu] SLURM's CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} may" >&2
+    echo "[gpu] select the held GPU 0. Verify placement by UUID, or pass a list." >&2
 elif [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    # Not under SLURM (or gres not in play): fall back to the non-held devices.
+    # Not under SLURM at all: fall back to the non-held devices.
     export CUDA_VISIBLE_DEVICES="1,2,3"
 fi
 echo "[gpu] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (SLURM_STEP_GPUS=${SLURM_STEP_GPUS:-unset})"
