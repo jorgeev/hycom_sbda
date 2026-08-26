@@ -60,8 +60,12 @@ from diffusion.sample import config_from_ckpt
 from diffusion.train import build_net
 
 
-def load_ckpt(path: str, device):
-    """``(net, cfg, meta)`` from a checkpoint, using the EMA weights.
+def load_ckpt(path: str, device, weights: str = "ema"):
+    """``(net, cfg, meta)`` from a checkpoint.
+
+    ``weights`` picks the state dict: ``"ema"`` (the default, as sample.py
+    uses) or ``"model"`` -- the raw online weights, for ablating whether the
+    500 kimg EMA average damps sample dispersion.
 
     Mirrors ``diffusion.sample.load_precond`` but also hands back the training
     metadata, so every figure can be stamped with the step it came from instead
@@ -70,10 +74,11 @@ def load_ckpt(path: str, device):
     sd = torch.load(path, map_location=device, weights_only=False)
     cfg = config_from_ckpt(sd["config"])
     net = build_net(cfg, "diffusion").to(device)
-    net.load_state_dict(sd["ema"])          # EMA weights, as sample.py does
+    net.load_state_dict(sd[weights])
     net.eval()
     meta = {"ckpt": os.path.abspath(path),
             "step": int(sd.get("step", -1)) + 1,
+            "weights": weights,
             "val_loss": float(sd["val_loss"]) if "val_loss" in sd else None,
             "best_val": float(sd["best_val"]) if "best_val" in sd else None}
     return net, cfg, meta
@@ -170,11 +175,14 @@ def main():
     ap.add_argument("--sampler-steps", type=int, default=None)
     ap.add_argument("--s-churn", type=float, default=None)
     ap.add_argument("--s-noise", type=float, default=None)
+    ap.add_argument("--weights", choices=("ema", "model"), default="ema",
+                    help="state dict to sample from: 'ema' (default) or the "
+                         "raw 'model' weights (EMA-length ablation)")
     args = ap.parse_args()
 
     ckpt = args.ckpt if args.ckpt.endswith(".pt") else os.path.join(args.ckpt, "ckpt.pt")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net, cfg, meta = load_ckpt(ckpt, device)
+    net, cfg, meta = load_ckpt(ckpt, device, weights=args.weights)
     print(f"[ckpt] {ckpt}\n[ckpt] step={meta['step']} val_loss={meta['val_loss']} "
           f"best_val={meta['best_val']}")
 

@@ -29,7 +29,7 @@ reject_land: false
 ocean_frac: 0.5
 crops_per_day: 8
 norm_mode: anomaly
-clim_vars: [SST]              # seasonal climatology; SSH/CHL get a time-mean
+clim_vars: [SST, CHL]              # seasonal climatology; SSH/CHL get a time-mean
 val_gap_days: 0               # departure: GenDA holds out a year between splits
 
 # --- model ------------------------------------------------------------------
