@@ -37,7 +37,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Patch
-from scipy import stats
+from scipy import ndimage, stats
 
 from . import kernels as K
 
@@ -49,22 +49,63 @@ STYLE = {
     "ssh":   ("Spectral_r", False), "sst": ("RdYlBu_r", False),
     "sss":   ("viridis",    False), "uag": ("RdBu_r",   True),
     "vag":   ("RdBu_r",     True),  "tau_x": ("PuOr_r", True),
-    "tau_y": ("PuOr_r",     True),
+    "tau_y": ("PuOr_r",     True),  "chl": ("YlGn",     False),
+    "mld":   ("cividis",    False),
 }
 UNITS = {"ssh": "m", "sst": "degC", "sss": "psu", "uag": "m/s", "vag": "m/s",
-         "tau_x": "N/m2", "tau_y": "N/m2"}
+         "tau_x": "N/m2", "tau_y": "N/m2", "mld": "m",
+         # gom_nemo takes log10 of CHL in the loader (descriptor `log10: true`),
+         # so the model's channel, and everything here, is in log space.
+         "chl": "log10(mg/m3)"}
 BANDS = [("mesoscale 40-150 km", 40.0, 150.0), ("submeso 10-40 km", 10.0, 40.0)]
+
+# How much of a frame to throw away before pooling pixels. Both numbers are
+# MEASURED on prior_genda_masked, not chosen for looking safe; both are written
+# up in the corresponding gotchas in eval/README.md.
+#
+# GRAD_ERODE_PX -- how far from a coastline a spatial derivative is still
+# contaminated. Land enters as an exact 0.0 anomaly, so np.gradient across an
+# ocean->land step manufactures velocity. The numerical smear is only 1 px wide,
+# but the contaminated RIM is wider: real geostrophic EKE binned by distance
+# from that patch's own coast runs 80x the far field at 1-2 px, 10x at 2-3 px,
+# 3x at 3-4 px and 2x at 4-6 px, reaching background only near 6 px. The old
+# 2 px erosion kept everything from 3 px outward -- a rim still 2-3x too bright.
+#
+# 6 px is where the answer stops moving, which is the real argument for it: the
+# real patch-mean EKE is 0.0438 at 2 px, 0.0408 at 6 and 0.0409 at 10, then
+# drifts UP to 0.0426 at 24 as the surviving pixels become a deep-basin
+# subsample rather than a cleaner one. A thin tail of contaminated pixels does
+# survive 6 px (the map's 99.9th percentile falls 0.163 -> 0.102 between 6 and
+# 10 px) but it is 0.1 % of pixels and worth 0.2 % of the mean.
+GRAD_ERODE_PX = 6
+
+# PATCH_BORDER_PX -- the frame edge itself. A generated patch contains no land,
+# but the UNet's zero padding leaves an energy halo at its border: generated
+# geostrophic EKE is 0.0855 within 2-4 px of the frame against 0.0648 in the
+# interior (+32 %), while the real side is flat over the same bins (0.0454 vs
+# 0.0407). Split-half reproducibility of the generated mean EKE map falls from
+# r = 0.78 with a 2 px cut to 0.45 at 16 px and 0.29 at 32 px -- 0.29 being the
+# real side's own level -- so the reproducible structure in that map is the
+# border, not geography (it correlates with land frequency at -0.06). 16 px is
+# where the inflation drops into the sample noise.
+#
+# Applied in PATCH geometry only, and identically to both sides: at full frame
+# the frame edge is a real domain boundary that the real fields share, and
+# erode_mask already drops the one-sided-gradient row. The spectra are exempt
+# because an FFT needs a whole rectangle, and radial_psd's 2-D Hann window
+# already weights the outer 16 px of a 128 px tile below 0.15 in amplitude.
+PATCH_BORDER_PX = 16
 
 # These two tables cover prior_gulfstream's seven channels. A config with a
 # different target set still plots -- it just gets a neutral diverging map and a
 # blank unit rather than a KeyError, in keeping with the repo's rule that no
 # module hardcodes a store's variable names.
 def _style(v: str) -> tuple[str, bool]:
-    return STYLE.get(v, ("RdBu_r", True))
+    return STYLE.get(v.lower(), ("RdBu_r", True))
 
 
 def _unit(v: str) -> str:
-    return UNITS.get(v, "")
+    return UNITS.get(v.lower(), "")
 
 
 class Samples:
@@ -86,8 +127,63 @@ class Samples:
         self.days = d["real_days"]
         self.ref_day = int(d["ref_day"])
         self.n, self.c, self.ny, self.nx = self.gen_a.shape
+        # Channel names are the store's, and stores disagree on case: gulfstream
+        # calls it `ssh`, gom_nemo `SSH`. Physics-aware figures ask for the
+        # channel by its conventional lowercase name and get whatever this store
+        # actually calls it, or None.
+        self._byname = {v.lower(): v for v in self.vars}
+        pos = d["real_pos"]
+        self.is_patch = bool(pos.size)
+        # Spacing of the crop lattice the real patches came from, read off the
+        # corners rather than assumed. It is the period at which a patch-relative
+        # SAMPLE MEAN aliases the domain's own geography: patch pixel (i, j) and
+        # (i + stride, j) average almost the same set of absolute positions, so a
+        # mean map in patch geometry is a FOLD of the domain, not a map of it.
+        # Measured on prior_genda_masked, the real mean-EKE map's shift
+        # autocorrelation is 0.02 at 24 px, 0.67 at 32 px and 0.05 at 36 px --
+        # a lattice spike, not a smooth field.
+        self.crop_stride = 0
+        if self.is_patch:
+            p0 = np.asarray(pos, dtype=int)
+            dif = np.concatenate([np.diff(np.unique(p0[:, 0])),
+                                  np.diff(np.unique(p0[:, 1]))])
+            self.crop_stride = int(dif.min()) if dif.size else 0
+        # Interior mask: drops PATCH_BORDER_PX from every frame edge in patch
+        # geometry, all-True at full frame. See PATCH_BORDER_PX for the
+        # measurement, and note it is applied to BOTH sides -- the point is a
+        # like-for-like recipe, not a flattering one.
+        self.interior = np.ones((self.ny, self.nx), dtype=bool)
+        if self.is_patch and 2 * PATCH_BORDER_PX < min(self.ny, self.nx):
+            b = PATCH_BORDER_PX
+            self.interior[:b, :] = False
+            self.interior[-b:, :] = False
+            self.interior[:, :b] = False
+            self.interior[:, -b:] = False
+
+        # Land as the DATA reports it, per sample. The loader writes an exact
+        # 0.0 into EVERY channel at once on land, and no ocean pixel is exactly
+        # 0.0 in all of them, so this is an exact test rather than a threshold.
+        #
+        # It is also the authority, not the store's ``ocean_mask``: on gom_nemo
+        # that mask calls 143 pixels ocean whose data is zero in every frame of
+        # the record -- 12 blobs, the largest 102 px (~1600 km2, the size and
+        # place of Isla de la Juventud), the rest keys and islets. Because the
+        # mask does not know they are land, ``erode_mask`` never touches them
+        # and ``np.gradient`` runs straight across their coastline: they were
+        # drawing bright closed rings in the real EKE map next to the properly
+        # eroded islands, and they cost 4.8 % of the full-frame real EKE mean
+        # (3.7 % at patch level) out of 0.06 % of the pixels.
+        self.data_land = np.all(self.real_a == 0.0, axis=1)      # (N, H, W)
+        # Domain-level correction: a pixel that is land in most samples is land,
+        # whatever the stored mask says. In patch geometry ``mask`` is all ones
+        # and a given patch offset is land in ~12 % of crops, so this leaves it
+        # alone and the per-sample term below does the work.
+        self.mask_ocean = (self.mask > 0.5) & (self.data_land.mean(0) <= 0.5)
         # eroded mask for anything involving a spatial derivative
-        self.grad_mask = K.erode_mask(self.mask, 2)
+        self.grad_mask = K.erode_mask(self.mask_ocean, GRAD_ERODE_PX) & self.interior
+        # plain mask for statistics that pool pixels without differentiating
+        # (PDFs and moments, the channel correlation matrices)
+        self.stat_mask = self.mask_ocean & self.interior
         # Per-sample equivalent for the REAL side. In patch mode ``mask`` is
         # all ones (a generated patch is nowhere, see gen_prior), but each REAL
         # patch was cropped somewhere: land pixels inside it hold anomaly ==
@@ -98,37 +194,113 @@ class Samples:
         # regular grid of bright blobs (see the land-edge EKE gotcha in
         # eval/README.md). Rebuild each real patch's eroded ocean mask from its
         # crop corner and the full-domain mask.
-        pos = d["real_pos"]
+        #
+        # The SAME contamination reaches every other real-side statistic, not
+        # just the derivative ones. On gom_nemo the grid crop lattice admits any
+        # patch with ocean_frac >= 0.5, so real patches average 87.5 % ocean and
+        # dip to 51 %, while a generated patch is all ocean by construction.
+        # Land enters as an exact 0.0 anomaly, so pooling it into the real side
+        # of a comparison:
+        #   - drags the real std down and the real kurtosis up (fig_pdf),
+        #   - correlates every channel perfectly wherever it appears
+        #     (fig_crosschannel),
+        #   - and, worst by far, puts a step edge in the real field that the
+        #     FFT reads as broadband power. Measured on prior_genda_masked at
+        #     step 1,130,000 that inflates the real 10-40 km PSD by 40x for SSH
+        #     (whose true submesoscale power is minuscule) and ~4x for SST and
+        #     CHL, which turned a genuine 5x EXCESS of SSH grid-scale power into
+        #     an apparent 0.18 deficit -- the opposite diagnosis.
+        # So keep three things: the eroded per-sample mask for derivatives, the
+        # plain per-sample mask for pixel statistics, and a per-sample flag for
+        # the figures that need a whole rectangle (spectra) and must select
+        # land-free samples instead of masking pixels.
         full = d["mask_full"] if "mask_full" in d.files else np.zeros((0, 0))
         if pos.size and full.size:
-            rgm = np.empty((self.n, self.ny, self.nx), dtype=bool)
-            for i, (y0, x0) in enumerate(np.asarray(pos, dtype=int)):
-                rgm[i] = K.erode_mask(full[y0:y0 + self.ny, x0:x0 + self.nx], 2)
-            self.real_grad_mask = rgm & self.grad_mask
+            base = np.stack([full[y0:y0 + self.ny, x0:x0 + self.nx] > 0.5
+                             for y0, x0 in np.asarray(pos, dtype=int)])
         else:
             if pos.size:
-                print("[diag] WARNING: patch npz predates mask_full -- real "
-                      "patches cannot be land-masked and derivative-based "
-                      "figures will show land-edge artifacts. Backfill recipe "
-                      "in eval/README.md.")
-            self.real_grad_mask = np.broadcast_to(
-                self.grad_mask, (self.n, self.ny, self.nx))
+                print("[diag] NOTE: patch npz predates mask_full -- the real "
+                      "patches' land is being taken from the data itself "
+                      "(all-channel zeros), which is exact; only the stored "
+                      "mask is missing.")
+            base = np.broadcast_to(self.mask > 0.5,
+                                   (self.n, self.ny, self.nx))
+        rm = base & ~self.data_land
+        rgm = np.stack([K.erode_mask(rm[i], GRAD_ERODE_PX)
+                        for i in range(self.n)])
+        self.real_grad_mask = rgm & self.grad_mask
+        self.real_mask = rm & self.stat_mask
+        # ``real_clean`` selects whole rectangles for the spectra. At full frame
+        # the tiles come from the shared ocean mask and every sample is usable;
+        # in patch geometry a sample is usable only if its crop holds no land.
+        self.real_clean = (rm.reshape(self.n, -1).all(axis=1) if self.is_patch
+                           else np.ones(self.n, dtype=bool))
+
+    def name(self, v: str) -> str | None:
+        """This store's spelling of channel ``v``, or None if it has no such channel."""
+        return self._byname.get(v.lower())
+
+    def has(self, *names: str) -> bool:
+        return all(self.name(v) is not None for v in names)
 
     def anom(self, which: str, v: str) -> np.ndarray:
         """(N, H, W) anomaly in PHYSICAL units (sigma * std), no climatology."""
-        i = self.vars.index(v)
+        i = self.vars.index(self.name(v) or v)
         a = self.gen_a if which == "gen" else self.real_a
         return a[:, i] * self.std[i]
 
     def phys(self, which: str, v: str) -> np.ndarray:
         """(N, H, W) full field: anomaly + reference-day climatology."""
-        i = self.vars.index(v)
+        i = self.vars.index(self.name(v) or v)
         a = self.gen_a if which == "gen" else self.real_a
         return K.to_physical(a[:, i], self.std[i], self.clim[i])
 
+    def run_name(self) -> str:
+        """The run this npz came from, read off the checkpoint path.
+
+        Not hardcoded: the same figures are produced for every config, and a
+        gulfstream label on a gom_nemo figure is the kind of error that is only
+        noticed after the figure has been in a talk.
+        """
+        ck = self.meta.get("ckpt", "")
+        d = os.path.dirname(ck)
+        if os.path.basename(d) == "checkpoints":
+            d = os.path.dirname(d)
+        return os.path.basename(d) or "run"
+
+    def fold_note(self) -> str:
+        """The patch-geometry caveat for any SAMPLE-MEAN map, or "" at full frame.
+
+        See ``crop_stride``. The generated side inherits the same fold, because
+        its training patches came off the same lattice: measured here, the
+        generated and real 32 px folds correlate at +0.41 while their residuals
+        correlate at +0.09.
+        """
+        if not (self.is_patch and self.crop_stride):
+            return ""
+        return (f"patch-relative mean: the {self.crop_stride} px crop lattice "
+                f"folds the domain's own geography at {self.crop_stride} px, on "
+                "BOTH sides -- read the level, not the pattern")
+
+    def mask_note(self) -> str:
+        """One line recording which pixels were thrown away, and how many.
+
+        Every figure that pools pixels quotes this. A masking choice that is not
+        written next to the number it produced is a masking choice that gets
+        re-litigated six weeks later.
+        """
+        keep = 100.0 * float(self.interior.mean())
+        border = (f"{PATCH_BORDER_PX} px frame border dropped both sides "
+                  f"({keep:.0f} % of the patch kept)" if self.is_patch
+                  else "no frame-border cut (full geometry: the frame edge is a "
+                       "real boundary both sides share)")
+        return (f"masking: {GRAD_ERODE_PX} px land erosion before any "
+                f"derivative; {border}")
+
     def title(self) -> str:
         m = self.meta
-        return (f"prior_gulfstream  step {m['step']:,}  |  {self.size} "
+        return (f"{self.run_name()}  step {m['step']:,}  |  {self.size} "
                 f"{self.ny}x{self.nx}  |  N={self.n}  |  "
                 f"{m['sampler']['num_steps']} steps, s_churn={m['sampler']['s_churn']}")
 
@@ -179,11 +351,11 @@ def fig_gallery(S: Samples, out: str, ncol: int = 4, units: str = "physical"):
             cmap, sym = "RdBu_r", True
         real = S.anom("real", v) if anom else S.phys("real", v)
         gen = S.anom("gen", v) if anom else S.phys("gen", v)
-        lo, hi = _limits(real, S.mask, sym)
+        lo, hi = _limits(real, S.mask_ocean, sym)
         for c in range(ncol):
             for half, arr in ((0, gen), (1, real)):
                 ax = fig.add_subplot(gs[r, c + half * (ncol + 1)])
-                im = ax.imshow(_masked(arr[c], S.mask), origin="lower", cmap=cmap,
+                im = ax.imshow(_masked(arr[c], S.mask_ocean), origin="lower", cmap=cmap,
                                vmin=lo, vmax=hi, interpolation="nearest",
                                aspect="auto")
                 ax.set_xticks([]); ax.set_yticks([])
@@ -214,11 +386,11 @@ def fig_gallery_single(S: Samples, which: str, out: str, ncol: int = 8):
                              squeeze=False)
     for r, v in enumerate(S.vars):
         cmap, sym = _style(v)
-        lo, hi = _limits(S.phys("real", v), S.mask, sym)
+        lo, hi = _limits(S.phys("real", v), S.mask_ocean, sym)
         arr = S.phys(which, v)
         for c in range(ncol):
             ax = axes[r][c]
-            im = ax.imshow(_masked(arr[c % S.n], S.mask), origin="lower", cmap=cmap,
+            im = ax.imshow(_masked(arr[c % S.n], S.mask_ocean), origin="lower", cmap=cmap,
                            vmin=lo, vmax=hi, interpolation="nearest", aspect="auto")
             ax.set_xticks([]); ax.set_yticks([])
             if c == 0:
@@ -242,8 +414,15 @@ def fig_spectra(S: Samples, out: str) -> dict:
     power beyond that, which it was never shown, so the ratio curve to the left
     of that line is the interesting part.
     """
-    tile = 256 if min(S.ny, S.nx) >= 256 else min(S.ny, S.nx)
+    tile = K.psd_tile(S.mask_ocean, S.ny, S.nx)
     stride = tile // 2
+    nclean = int(S.real_clean.sum())
+    if nclean < S.n:
+        print(f"[diag] spectra: real side uses {nclean}/{S.n} land-free samples")
+    if nclean < 16:
+        print(f"[diag] WARNING: only {nclean} land-free real samples -- the "
+              "real spectrum is a small-sample estimate. Raise --n in "
+              "eval.gen_prior, or read the full geometry instead.")
     patch_km = 128 * S.dx_km
     res = {}
 
@@ -257,8 +436,13 @@ def fig_spectra(S: Samples, out: str) -> dict:
 
     for i, v in enumerate(S.vars):
         ax = fig.add_subplot(gs[i // ncol, i % ncol])
-        k, pg = K.mean_radial_psd(S.anom("gen", v), S.mask, S.dx_km, tile, stride)
-        _, pr = K.mean_radial_psd(S.anom("real", v), S.mask, S.dx_km, tile, stride)
+        k, pg = K.mean_radial_psd(S.anom("gen", v), S.mask_ocean, S.dx_km, tile,
+                                  stride)
+        # An FFT needs a whole rectangle, so the real side cannot mask land
+        # pixel-by-pixel the way fig_pdf does -- it has to drop the samples that
+        # contain any. See Samples.real_clean for what land does to a spectrum.
+        _, pr = K.mean_radial_psd(S.anom("real", v)[S.real_clean], S.mask_ocean,
+                                  S.dx_km, tile, stride)
         lam = 1.0 / k
         for p, col, lab in ((pr, "k", "real"), (pg, "crimson", "generated")):
             med = np.median(p, 0)
@@ -323,8 +507,10 @@ def fig_spectra(S: Samples, out: str) -> dict:
                   "is asked for structure larger\nthan anything it was trained on.\n\n"
                   "dotted: 2dx Nyquist. Nothing to\nthe right of it is real.",
                   fontsize=8.5, va="center")
-    fig.suptitle(f"Radial power spectra of anomalies ({tile}px tiles)  --  " + S.title(),
-                 fontsize=11)
+    clean_note = ("" if nclean == S.n
+                  else f", real side from the {nclean}/{S.n} land-free samples")
+    fig.suptitle(f"Radial power spectra of anomalies ({tile}px tiles"
+                 f"{clean_note})  --  " + S.title(), fontsize=11)
     fig.savefig(out, dpi=150)
     plt.close(fig)
     return res
@@ -353,7 +539,9 @@ def fig_pdf(S: Samples, out: str) -> dict:
         ax = axes.flat[i]
         vals = {}
         for which, col in (("real", "k"), ("gen", "crimson")):
-            x = K.ocean_values(S.anom(which, v), S.mask, seed=1)
+            x = K.ocean_values(S.anom(which, v),
+                               S.real_mask if which == "real" else S.stat_mask,
+                               seed=1)
             vals[which] = x
             grid = np.linspace(*np.percentile(x, [0.05, 99.95]), 400)
             ax.plot(grid, stats.gaussian_kde(x)(grid), color=col, lw=1.6,
@@ -400,11 +588,55 @@ def _velocities(S: Samples, which: str):
     fields rather than taking it on faith.
     """
     ssh = S.anom(which, "ssh")
-    uag, vag = S.anom(which, "uag"), S.anom(which, "vag")
     ug = np.empty_like(ssh); vg = np.empty_like(ssh)
     for i in range(ssh.shape[0]):
         ug[i], vg[i] = K.geostrophic_uv(ssh[i], S.dx_m, S.lat)
+    # prior_genda_masked is a three-channel prior (ssh/sst/chl) with no
+    # ageostrophic velocity to add, so there is no "total" to report -- the
+    # geostrophic part IS the whole of what this prior says about the flow.
+    if not S.has("uag", "vag"):
+        return (ug, vg), None, None
+    uag, vag = S.anom(which, "uag"), S.anom(which, "vag")
     return (ug, vg), (uag, vag), (ug + uag, vg + vag)
+
+
+# A pixel counts as sitting on a one-cell STEP when the two-cell difference
+# across it is at least this multiple of half the four-cell difference. A
+# resolved front scores ~1 (the four-cell difference is twice the two-cell one);
+# a true discontinuity scores ~2, because both differences span the same jump.
+STEP_SCORE = 1.9
+
+
+def _step_rate(S: Samples, which: str, mask: np.ndarray) -> float:
+    """Fraction of masked pixels on a one-cell step in EVERY channel at once.
+
+    This is the only statistic here that separates a drawn coastline from a
+    sharp ocean front. A front is resolved -- it spans two or three cells, and
+    it is sharp in SST and CHL while SSH stays smooth across it. A coastline is
+    a discontinuity, and it steps in all three channels at the same pixel
+    because the loader wrote the same 0.0 into all three. So: score each channel
+    for one-cell-ness where its jump is large, then take the MINIMUM over
+    channels.
+
+    It separates in patch geometry and does not at full frame -- see the "drawn
+    coastlines" gotcha in eval/README.md, which also says why the full-frame
+    real side is not a clean control.
+    """
+    sc = None
+    for v in S.vars:
+        a = S.anom(which, v)
+        best = np.zeros_like(a)
+        for ax in (1, 2):
+            d2 = np.abs(np.roll(a, -1, ax) - np.roll(a, 1, ax))
+            d4 = np.abs(np.roll(a, -2, ax) - np.roll(a, 2, ax))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                r = np.where(d4 > 0, 2.0 * d2 / d4, 0.0)
+            # Only where the jump is big for this field: the ratio is unstable
+            # and meaningless in a flat region, where d2 and d4 are both noise.
+            big = d2 > np.quantile(d2[mask], 0.9)
+            best = np.maximum(best, np.where(big, r, 0.0))
+        sc = best if sc is None else np.minimum(sc, best)
+    return float(np.mean(sc[mask] > STEP_SCORE))
 
 
 def fig_eke(S: Samples, out: str) -> dict:
@@ -419,6 +651,14 @@ def fig_eke(S: Samples, out: str) -> dict:
     shared ``grad_mask`` (its land, if any, is wherever the model drew it), the
     real side uses ``real_grad_mask`` so each patch's own land edges never meet
     np.gradient. In full geometry the two masks coincide.
+
+    Both masks drop ``GRAD_ERODE_PX`` = 6 px around land, which is where the
+    land-edge EKE rim actually reaches background, and in patch geometry both
+    drop a ``PATCH_BORDER_PX`` = 16 px frame border, which is where the
+    generated side's zero-padding halo dies out. The two corrections push the
+    ratio in opposite directions and largely cancel; the point of making them is
+    the MAPS, which were showing coastline outlines on the real side and a
+    saturated frame on the generated one. Read the constants for the numbers.
     """
     m = S.grad_mask
     rm = S.real_grad_mask                                 # (N, H, W)
@@ -426,33 +666,56 @@ def fig_eke(S: Samples, out: str) -> dict:
     fields = {}
     for which in ("gen", "real"):
         geo, ageo, tot = _velocities(S, which)
-        fields[which] = {"geostrophic": K.eke(*geo), "ageostrophic": K.eke(*ageo),
-                         "total": K.eke(*tot)}
+        fields[which] = {"geostrophic": K.eke(*geo)}
+        if ageo is not None:
+            fields[which]["ageostrophic"] = K.eke(*ageo)
+            fields[which]["total"] = K.eke(*tot)
         for part, arr in fields[which].items():
             sel = arr[rm] if which == "real" else arr[:, m]
             res[f"eke_{part}_{which}"] = float(np.nanmean(sel))
-    for part in ("geostrophic", "ageostrophic", "total"):
+    parts = list(fields["gen"])
+    for part in parts:
         res[f"eke_{part}_ratio"] = res[f"eke_{part}_gen"] / res[f"eke_{part}_real"]
+    gm3 = np.broadcast_to(m, (S.n, S.ny, S.nx))
+    res["step_rate_gen"] = _step_rate(S, "gen", gm3)
+    res["step_rate_real"] = _step_rate(S, "real", rm)
+    res["step_rate_ratio"] = (res["step_rate_gen"]
+                              / max(res["step_rate_real"], 1e-12))
+    # The map and histogram panels show the most complete energy this prior has.
+    main = "total" if "total" in parts else "geostrophic"
 
     # Generated side: average over samples FIRST, then mask. Masking first
     # would leave every masked pixel as a column of all-NaN, and averaging that
     # is a mean of an empty slice -- same numbers, but a screenful of warnings.
-    gmap = _masked(fields["gen"]["total"].mean(0), m)
+    gmap = _masked(fields["gen"][main].mean(0), m)
     # Real side: each sample has its own mask, so a plain mean(0) is exactly
     # the bug this masking exists to fix. Sum/count keeps a pixel's mean over
     # the samples where it is valid ocean and divides all-masked pixels to NaN
     # without an empty-slice warning.
     cnt = rm.sum(0)
-    rsum = np.where(rm, fields["real"]["total"], 0.0).sum(0)
+    rsum = np.where(rm, fields["real"][main], 0.0).sum(0)
     rmap = np.where(cnt > 0, rsum / np.maximum(cnt, 1), np.nan)
-    vmax = float(np.nanpercentile(rmap, 99))
+    # Scale to BOTH maps, not just the real one. When the real side is clean its
+    # 99th percentile can sit below the generated side's mean -- masking the
+    # under-masked islands dropped it from 0.078 to 0.050 while the generated
+    # mean is 0.064 -- and a real-only vmax then saturates both panels to a flat
+    # block of colour.
+    both = np.concatenate([rmap[np.isfinite(rmap)], gmap[np.isfinite(gmap)]])
+    vmax = float(np.percentile(both, 99))
 
     fig, axes = plt.subplots(2, 3, figsize=(16.5, 8.2))
     for ax, (arr, ttl) in zip(axes[0][:2],
                               ((gmap, "generated"), (rmap, "real"))):
         im = ax.imshow(arr, origin="lower", cmap="magma", vmin=0, vmax=vmax,
                        aspect="auto")
-        ax.set_title(f"mean total EKE, {ttl}", fontsize=10)
+        ax.set_title(f"mean {main} EKE, {ttl}", fontsize=10)
+        side = "gen" if ttl == "generated" else "real"
+        lab = []
+        if S.fold_note():
+            lab.append(f"folded at {S.crop_stride} px (crop lattice)")
+        lab.append(f"one-cell steps in all channels: "
+                   f"{res[f'step_rate_{side}'] * 1e4:.1f} per 10k px")
+        ax.set_xlabel("  |  ".join(lab), fontsize=7, color="0.35")
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(im, ax=ax, fraction=0.03).set_label("m2/s2", fontsize=8)
 
@@ -480,7 +743,7 @@ def fig_eke(S: Samples, out: str) -> dict:
     ax.plot(np.nanmean(rmap[rows], 1), yy[rows], "k", lw=1.6, label="real")
     ax.plot(np.nanmean(gmap[rows], 1), yy[rows], "crimson", lw=1.6,
             label="generated")
-    ax.set_xlabel("zonal-mean EKE [m2/s2]", fontsize=8)
+    ax.set_xlabel(f"zonal-mean {main} EKE [m2/s2]", fontsize=8)
     ax.set_ylabel("latitude [degN]" if varies else "grid row (south -> north)",
                   fontsize=8)
     ax.set_title("meridional structure", fontsize=10)
@@ -489,8 +752,8 @@ def fig_eke(S: Samples, out: str) -> dict:
 
     ax = axes[1][1]
     per_sample = {
-        "gen": np.nanmean(fields["gen"]["total"][:, m], axis=1),
-        "real": (np.where(rm, fields["real"]["total"], 0.0).sum((1, 2))
+        "gen": np.nanmean(fields["gen"][main][:, m], axis=1),
+        "real": (np.where(rm, fields["real"][main], 0.0).sum((1, 2))
                  / np.maximum(rm.sum((1, 2)), 1)),
     }
     # Shared bin edges: per-series bins would put the two histograms on
@@ -500,20 +763,20 @@ def fig_eke(S: Samples, out: str) -> dict:
     for which, col in (("real", "k"), ("gen", "crimson")):
         ax.hist(per_sample[which], bins=bins, histtype="step", color=col,
                 lw=1.6, label=which)
-    ax.set_xlabel("domain-mean total EKE [m2/s2]", fontsize=8)
+    ax.set_xlabel(f"domain-mean {main} EKE [m2/s2]", fontsize=8)
     ax.set_ylabel("samples", fontsize=8)
     ax.set_title("spread across samples", fontsize=10)
     ax.legend(fontsize=8, frameon=False); ax.grid(alpha=0.25, lw=0.4)
     ax.tick_params(labelsize=7)
 
     ax = axes[1][2]
-    parts = ["geostrophic", "ageostrophic", "total"]
-    xs = np.arange(3)
+    xs = np.arange(len(parts))
     ax.bar(xs - 0.19, [res[f"eke_{p}_real"] for p in parts], 0.36, color="0.25",
            label="real")
     ax.bar(xs + 0.19, [res[f"eke_{p}_gen"] for p in parts], 0.36, color="crimson",
            label="generated")
     ax.set_xticks(xs); ax.set_xticklabels(parts, fontsize=8)
+    ax.set_xlim(-0.6, len(parts) - 0.4)
     ax.set_ylabel("domain-mean EKE [m2/s2]", fontsize=8)
     ax.set_title("energy budget", fontsize=10)
     for i, p in enumerate(parts):
@@ -522,8 +785,12 @@ def fig_eke(S: Samples, out: str) -> dict:
     ax.legend(fontsize=8, frameon=False); ax.grid(alpha=0.25, axis="y", lw=0.4)
     ax.tick_params(labelsize=7)
 
-    fig.suptitle("Eddy kinetic energy: geostrophy from the ssh anomaly + the "
-                 "uag/vag channels  --  " + S.title(), fontsize=11)
+    src = ("geostrophy from the ssh anomaly + the uag/vag channels"
+           if "total" in parts else
+           "geostrophy from the ssh anomaly (no ageostrophic channels in this prior)")
+    fold = ("\n" + S.fold_note()) if S.fold_note() else ""
+    fig.suptitle(f"Eddy kinetic energy: {src}  --  " + S.title()
+                 + "\n" + S.mask_note() + fold, fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(out, dpi=150)
     plt.close(fig)
@@ -541,8 +808,8 @@ def fig_crosschannel(S: Samples, out: str) -> dict:
     every opportunity to learn: the geostrophic velocity implied by its own ssh
     against the ageostrophic velocity it drew alongside it.
     """
-    cg = K.corr_matrix(S.gen_a, S.mask, seed=2)
-    cr = K.corr_matrix(S.real_a, S.mask, seed=2)
+    cg = K.corr_matrix(S.gen_a, S.stat_mask, seed=2)
+    cr = K.corr_matrix(S.real_a, S.real_mask, seed=2)
     diff = cg - cr
     res = {"corr_frobenius_error": float(np.linalg.norm(diff)),
            "corr_max_abs_error": float(np.abs(diff).max())}
@@ -564,6 +831,27 @@ def fig_crosschannel(S: Samples, out: str) -> dict:
         fig.colorbar(im, ax=ax, fraction=0.045)
 
     m = S.grad_mask
+    # Panels (d)-(e) test ssh-implied geostrophy against the drawn ageostrophic
+    # velocity. A prior without uag/vag channels has no such relationship to
+    # test, so the correlation matrices above stand alone.
+    if not S.has("ssh", "uag", "vag"):
+        for ax in axes[1]:
+            ax.axis("off")
+        axes[1][0].text(
+            0.0, 0.5,
+            "No geostrophic/ageostrophic panel:\nthis prior has no uag/vag "
+            "channels,\nso there is no drawn ageostrophic\nvelocity to test "
+            "its own ssh against.\n\nThe correlation matrices above are the\n"
+            "whole of the cross-channel check here.\n\n"
+            f"Frobenius |gen - real| = {res['corr_frobenius_error']:.3f}\n"
+            f"largest single error   = {res['corr_max_abs_error']:.3f}",
+            fontsize=9.5, va="center")
+        fig.suptitle("Cross-channel structure  --  " + S.title(), fontsize=11)
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+        fig.savefig(out, dpi=150)
+        plt.close(fig)
+        return res
+
     pts = {}
     for which in ("real", "gen"):
         geo, ageo, _ = _velocities(S, which)
@@ -636,6 +924,7 @@ def write_report(S: Samples, spec: dict, pdf: dict, eke: dict, cross: dict,
          f"s_churn={m['sampler']['s_churn']}, s_noise={m['sampler']['s_noise']}",
          f"- climatology reference step (both sides): {S.ref_day}",
          f"- latitude for geostrophy: {m['lat_note']}",
+         f"- {S.mask_note()}",
          "",
          "All ratios below are generated / real. 1.00 is perfect.",
          "All statistics are computed on ANOMALIES -- adding the shared "
@@ -656,15 +945,22 @@ def write_report(S: Samples, spec: dict, pdf: dict, eke: dict, cross: dict,
     L += ["", "## Energetics", "",
           "| component | real | generated | ratio |", "|---|---|---|---|"]
     for part in ("geostrophic", "ageostrophic", "total"):
+        if f"eke_{part}_real" not in eke:
+            continue                        # prior without uag/vag channels
         L.append(f"| {part} EKE [m2/s2] | {eke[f'eke_{part}_real']:.4f} | "
                  f"{eke[f'eke_{part}_gen']:.4f} | {eke[f'eke_{part}_ratio']:.2f} |")
+    if "eke_total_real" not in eke:
+        L += ["", "Geostrophic only: this prior carries no ageostrophic "
+              "velocity channels, so there is no total to report."]
 
     L += ["", "## Cross-channel", "",
           f"- Frobenius norm of the correlation-matrix error: "
           f"**{cross['corr_frobenius_error']:.3f}** (0 = perfect)",
           f"- largest single correlation error: {cross['corr_max_abs_error']:.3f}",
-          f"- corr(geostrophic u from ssh, uag): real "
-          f"{cross['r_ug_uag_real']:+.3f}, generated {cross['r_ug_uag_gen']:+.3f}",
+          *([f"- corr(geostrophic u from ssh, uag): real "
+             f"{cross['r_ug_uag_real']:+.3f}, generated "
+             f"{cross['r_ug_uag_gen']:+.3f}"]
+            if "r_ug_uag_real" in cross else []),
           "", "## How to read this", "",
           "- **std ratio well below 1** means the prior is under-dispersed: it "
           "draws samples that are too smooth/too weak overall.",
@@ -674,7 +970,71 @@ def write_report(S: Samples, spec: dict, pdf: dict, eke: dict, cross: dict,
           "ssh gradient, so it punishes both over-smoothing and noise.",
           "- **Frobenius correlation error** is the joint-prior check. Good "
           "marginals with a bad correlation matrix means the model has learned "
-          "seven fields but not one ocean.", ""]
+          f"{S.c} fields but not one ocean.", "",
+          "## What was masked, and why", "",
+          f"- **{GRAD_ERODE_PX} px land erosion** before any spatial "
+          "derivative, up from 2 px, and measured as a Euclidean distance "
+          "rather than by iterated four-neighbour erosion (which is a diamond: "
+          "at 6 it cleared the diagonals to only ~4 px, and the 4-6 px ring it "
+          "left behind still had mean EKE 0.075 against 0.032 at 8-10 px). Real "
+          "EKE binned by distance from that patch's own coast runs 80x the far "
+          "field at 1-2 px, 10x at 2-3 px, 3x at 3-4 px and 2x at 4-6 px. 6 px "
+          "is where the answer stops moving: the real patch mean is 0.0438 at "
+          "2 px, 0.0408 at 6 and 0.0409 at 10, then drifts up to 0.0426 at 24 "
+          "as the survivors become a deep-basin subsample rather than a cleaner "
+          "one.",
+          (f"- **{PATCH_BORDER_PX} px frame border excluded**, both sides. A "
+           "generated patch has no land, but the UNet's zero padding inflates "
+           "EKE by ~32 % within 2-4 px of the frame (real is flat there), and "
+           "the generated mean-EKE map's split-half reproducibility falls from "
+           "r = 0.78 at a 2 px cut to 0.29 at 32 px -- the real side's own "
+           "level. The reproducible structure was the border, not geography."
+           if S.is_patch else
+           "- **No frame-border cut**: at full frame the edge is a real domain "
+           "boundary that generated and real fields share."),
+          "- **The spectra are exempt from the border cut.** An FFT needs a "
+          "whole rectangle, and `radial_psd` already applies a 2-D Hann window "
+          "that weights the outer 16 px of a 128 px tile below 0.15 in "
+          "amplitude. The real side instead drops land-contaminated samples "
+          "whole (`real_clean`); the figure title says how many survived.",
+          *([f"- **The two EKE maps are folds, not maps.** Real patches come "
+             f"off a {S.crop_stride} px crop lattice, so patch pixel (i, j) and "
+             f"(i + {S.crop_stride}, j) average nearly the same absolute "
+             "positions and the sample-mean map repeats the domain's geography "
+             f"at {S.crop_stride} px. The generated side shows the same period "
+             "-- it was trained on that lattice -- and the two folds correlate "
+             "at +0.41 against +0.09 for what is left after removing them. The "
+             "shift autocorrelation is 0.02 at 24 px, 0.67 at 32 px, 0.05 at "
+             "36 px on the real side. Read the level of those panels and the "
+             "log-ratio, not the pattern; the fold amplitude is +-13 % of the "
+             "mean on the real side and +-24 % on the generated one."]
+            if S.is_patch and S.crop_stride else []),
+          "", "## Drawn coastlines (generated side)", "",
+          "The bright closed rings in the generated EKE map are the model's "
+          "own work, not a masking artifact: it draws coastline-shaped "
+          "discontinuities in open ocean -- closed curves across which SSH, "
+          "SST and CHL all step in a single cell. `prior_genda_masked` is the "
+          "arm that KEEPS land in the training distribution "
+          "(`reject_land: false`, `loss_reduction: masked_mean`), so the "
+          "coastline is part of what it was asked to learn to draw.", "",
+          f"- one-cell steps in every channel at once: **"
+          f"{eke['step_rate_gen'] * 1e4:.1f} per 10k ocean px** generated, "
+          f"{eke['step_rate_real'] * 1e4:.1f} real "
+          f"(x{eke['step_rate_ratio']:.1f}).",
+          "- This statistic separates the two sides in PATCH geometry and does "
+          "not at full frame. Do not read a full-frame ratio near 1 as absence: "
+          "the real full-frame field is not a clean control, because the store "
+          "carries ~37 isolated locations of bad pixels that are neither land "
+          "nor ocean signal and that imply up to 6.7 m/s of geostrophic "
+          "velocity. See eval/README.md.",
+          "- It does not drive the energy scalar. Dropping the top 1 % of "
+          "joint-gradient pixels moves the full-frame EKE ratio the wrong way "
+          "(1.65 -> 1.69): the excess is broadly distributed, and the drawn "
+          "coastlines are a separate, smaller defect that dominates the MAP.", "",
+          "- The two corrections move the EKE ratio in opposite directions "
+          "(erosion lowers the real side, the border cut lowers the generated "
+          "side) and largely cancel. They were made for the maps, which were "
+          "misleading, not for the scalar, which was not.", ""]
 
     rep = os.path.join(out_dir, "report.md")
     with open(rep, "w") as f:

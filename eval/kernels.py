@@ -20,7 +20,7 @@ crashing.
 from __future__ import annotations
 
 import numpy as np
-from scipy import stats
+from scipy import ndimage, stats
 
 OMEGA = 7.2921e-5      # earth rotation rate, s^-1
 G = 9.81               # gravity, m s^-2
@@ -87,6 +87,31 @@ def tile_positions(mask: np.ndarray, tile: int, stride: int,
             if m[y0:y0 + tile, x0:x0 + tile].sum() >= need:
                 out.append((y0, x0))
     return out
+
+
+def psd_tile(mask: np.ndarray, ny: int, nx: int,
+             candidates: tuple[int, ...] = (256, 192, 128, 96, 64),
+             min_frac: float = 0.999) -> int:
+    """Largest square tile that both fits the domain and finds an ocean window.
+
+    A fixed 256 works on an open-ocean box like gulfstream and fails outright on
+    the Gulf of Mexico: at 464x528 with 63.8 % ocean, land is one large connected
+    region and NO 256x256 window -- nor 192 -- is even 95 % ocean, so
+    ``tile_positions`` returns nothing and ``mean_radial_psd`` raises.
+
+    The fix is to shrink the tile, not to relax ``min_frac``. Land enters the
+    anomaly field as exact zeros, which is the mean, so a tile straddling
+    Florida is a large hole rather than a slightly noisier estimate, and its
+    spectrum is dominated by the edge. A smaller all-ocean tile measures less of
+    the spectrum but measures it correctly.
+
+    Returns ``min(ny, nx)`` if no candidate qualifies, which is the whole-frame
+    behaviour the 128 px patch geometry wants.
+    """
+    for t in candidates:
+        if t <= min(ny, nx) and tile_positions(mask, t, t // 2, min_frac):
+            return t
+    return min(ny, nx)
 
 
 def mean_radial_psd(stack: np.ndarray, mask: np.ndarray, dx_km: float,
@@ -172,16 +197,28 @@ def erode_mask(mask: np.ndarray, pix: int = 2) -> np.ndarray:
     spurious gradient spike across its neighbours -- 17 pixels is nothing for a
     domain mean but plenty to set the colour scale of an EKE map. Eroding also
     drops the frame edge, where ``np.gradient`` is one-sided.
+
+    The default ``pix=2`` removes the NUMERICAL smear only, which is all the
+    selftest below needs. It does NOT remove the physical land-edge rim: on
+    gom_nemo, real geostrophic EKE binned by distance from the coast is still
+    3x the far field at 3-4 px and 2x at 4-6 px, reaching background near 6 px.
+    Anything that pools EKE near a coastline should pass 6 -- see
+    ``GRAD_ERODE_PX`` in ``diagnostics.py``, which is where that measurement is
+    written down.
+
+    ``pix`` is a EUCLIDEAN radius: a pixel survives only if the nearest land is
+    strictly more than ``pix`` away. This used to be four-neighbour erosion
+    iterated ``pix`` times, which is erosion by a DIAMOND -- it clears the
+    cardinal directions to ``pix`` but the diagonals only to ``pix/sqrt(2)``.
+    At ``pix=6`` that left a ring of pixels 4-6 px from land whose mean EKE was
+    still 0.075 against 0.032 at 8-10 px, i.e. the rim this function exists to
+    remove, surviving in the corners of the diamond and drawing exactly the
+    coastline outlines that motivated widening it in the first place.
     """
     m = np.asarray(mask) > 0.5
-    out = m.copy()
-    for _ in range(pix):
-        shr = out.copy()
-        shr[1:, :] &= out[:-1, :]
-        shr[:-1, :] &= out[1:, :]
-        shr[:, 1:] &= out[:, :-1]
-        shr[:, :-1] &= out[:, 1:]
-        out = shr
+    # distance_transform_edt measures distance to the nearest zero; with no land
+    # in this window there is nothing to erode away from, only the frame to trim.
+    out = (m & (ndimage.distance_transform_edt(m) > pix)) if (~m).any() else m.copy()
     out[:pix, :] = False
     out[-pix:, :] = False
     out[:, :pix] = False
@@ -225,9 +262,14 @@ def ocean_values(stack: np.ndarray, mask: np.ndarray, n_max: int = 200_000,
 
     Subsampling keeps ``gaussian_kde`` tractable -- 48 full frames is 26 M
     pixels, and the KDE is O(n) per evaluation point.
+
+    ``mask`` is either ``(H, W)``, applied to every sample, or ``(N, H, W)``,
+    one mask per sample -- which is what the real side of a patch comparison
+    needs, since each real crop carries its own land.
     """
     m = np.asarray(mask) > 0.5
-    v = np.asarray(stack)[:, m].ravel()
+    stack = np.asarray(stack)
+    v = stack[m] if m.ndim == 3 else stack[:, m].ravel()
     v = v[np.isfinite(v)]
     if v.size > n_max:
         rng = np.random.default_rng(seed)
@@ -242,10 +284,19 @@ def corr_matrix(stack: np.ndarray, mask: np.ndarray, n_max: int = 200_000,
     Pixels are pooled across samples and locations, so this measures the
     *local* co-variation of the channels -- whether a positive SSH anomaly comes
     with the SST and velocity anomalies it should.
+
+    ``mask`` is ``(H, W)`` or, for a real side whose samples each carry their
+    own land, ``(N, H, W)``. Land must not reach this: it is an exact 0.0 in
+    every channel at once, which reads as perfect correlation everywhere it
+    appears and quietly pulls the real matrix toward the identity.
     """
     m = np.asarray(mask) > 0.5
     n, c = stack.shape[:2]
-    v = np.asarray(stack)[:, :, m].transpose(1, 0, 2).reshape(c, -1)
+    stack = np.asarray(stack)
+    if m.ndim == 3:
+        v = np.stack([stack[:, j][m] for j in range(c)], axis=0)
+    else:
+        v = stack[:, :, m].transpose(1, 0, 2).reshape(c, -1)
     if v.shape[1] > n_max:
         rng = np.random.default_rng(seed)
         v = v[:, rng.choice(v.shape[1], size=n_max, replace=False)]
