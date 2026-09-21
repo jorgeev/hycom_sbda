@@ -162,6 +162,14 @@ eval/
   gen_prior.py      unconditional draws + matched real fields -> samples_*.npz
   diagnostics.py    samples_*.npz -> gallery, spectra, PDFs, EKE, cross-channel
   README.md         unit conventions and how to read each figure
+sda/
+  obs.py            observation operators A(x): masks, land-safe blur, YAML spec
+  vpsde.py          VP-cosine schedule, EDM<->eps adapter, predictor-corrector sampler
+  guidance.py       Gaussian-likelihood guidance through the network (GenDA)
+  case.py           store -> case_<size>.npz (truth, climatology, masks, y)
+  assimilate.py     case + prior checkpoint -> samples_sda_<size>.npz
+  diagnostics_sda.py  GenDA panels, observed/unobserved skill vs control
+  configs/          observing-system specs; README.md explains the units
 aws/
   Dockerfile        CUDA/torch image, deps pinned by requirements.txt
   launch.sh         single-node DDP training launcher (replaces train.slurm)
@@ -214,12 +222,26 @@ Read [`eval/README.md`](eval/README.md) first: the anomaly-vs-physical unit
 convention is load-bearing, and so is the reason patch-mode EKE is not a physical
 measurement.
 
+## Assimilating with a trained prior
+
+`sda/` is the score-based data assimilation layer: GenDA's inference (VP
+predictor-corrector, Gaussian-likelihood guidance through the network) on top of
+the priors above, with descriptor-driven observation operators and the store's
+own observation products as `y`. It writes ensembles in the `eval/*_cond`
+schema, so the paired diagnostics score them unchanged.
+
+```bash
+sbatch assimilate.slurm <run>/best.pt 1 sda/configs/gs_store_obs.yaml 24
+```
+
+Read [`sda/README.md`](sda/README.md) first: the units of the observation spec,
+the tide in the hourly SSH, and the meaning of `gamma` are all load-bearing.
+
 ## Not included
 
-The parent repo's *conditional* evaluation and assimilation stack —
-`evaluate.py`, `metrics.py`, `gate.py`, `baselines.py`, `eddies.py`,
-`seasonal.py`, `animate.py`, `obs_operator.py`, `assimilate.py`. Those are still
-coupled to Gulf-of-Mexico variable names and SSH-specific physics (geostrophy at
-a hardcoded latitude, Okubo-Weiss, AVISO cutoffs) and they evaluate ensembles
-against truth, which `eval/` does not attempt. Porting them is a separate pass;
-until then, run them from the parent repo against `ensembles.npz`.
+The parent repo's Gulf-of-Mexico evaluation stack — `evaluate.py`,
+`metrics.py`, `gate.py`, `baselines.py`, `eddies.py`, `seasonal.py`,
+`animate.py`. Those are still coupled to Gulf-of-Mexico variable names and
+SSH-specific physics (geostrophy at a hardcoded latitude, Okubo-Weiss, AVISO
+cutoffs). Its `obs_operator.py` / `assimilate.py` are superseded by `sda/`
+(the land-safe blur was borrowed; the clamped guidance was not).

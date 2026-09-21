@@ -1,0 +1,19 @@
+# GenDA-parity ablation (Martin et al. 2025 OSSE, inference/OSSE_inference.py):
+# synthetic observations built from the truth frame itself.
+#   pointwise SSH along synthetic nadir tracks, pointwise SST under the store's
+#   real cloud mask (sst_sat finite pattern), winds fully observed (std 1e-2),
+#   L4 proxies = Gaussian-blurred truth + noise for SSH/SST/SSS (25/16/16 km).
+# GenDA's 25 km is ~3 px on its 1/12 deg grid but 13.75 px here; the 8 px
+# border it nulls becomes `auto` = ceil(1.5 sigma_px).
+name: gs_genda_like
+defaults: {gamma: 0.1, border_px: auto}
+terms:
+  - {name: ssh_nadir, var: ssh,   kind: pointwise, y_source: truth, noise_std: 0.02,
+     mask: {source: tracks, spacing_km: 100, width_px: 1, angles_deg: [24, -24], jitter_deg: 5}}
+  - {name: sst_cloud, var: sst,   kind: pointwise, y_source: truth, noise_std: 0.3,
+     mask: {source: store_finite, var: sst_sat}}
+  - {name: tau_x,     var: tau_x, kind: pointwise, y_source: truth, mask: {source: full}, noise_std_norm: 1.0e-2}
+  - {name: tau_y,     var: tau_y, kind: pointwise, y_source: truth, mask: {source: full}, noise_std_norm: 1.0e-2}
+  - {name: ssh_l4,    var: ssh,   kind: blur, sigma_km: 25, y_source: truth, mask: {source: full}, noise_std: 0.02}
+  - {name: sst_l4,    var: sst,   kind: blur, sigma_km: 16, y_source: truth, mask: {source: full}, noise_std: 0.3}
+  - {name: sss_l4,    var: sss,   kind: blur, sigma_km: 16, y_source: truth, mask: {source: full}, noise_std: 0.05}

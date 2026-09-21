@@ -1,0 +1,51 @@
+# Observing system for the Gulf Stream HYCOM prior (runs/prior_gulfstream):
+# the store's OWN observation-like products as y, truth = the hourly state.
+#
+# Every number below was measured on the val split (2026-09-07; see
+# sda/README.md "Observation spec"). Two facts drive the design:
+#   1. the hourly truth SSH carries a near-uniform +-0.3 m tide that the
+#      AVISO-like product does not, and both SSHA products are relative to a
+#      mean SSH = record time-mean + 0.053 m  -> `demean: true` on both sides;
+#   2. sst_radiometer is a DAILY MEAN with an hour-dependent domain bias up to
+#      +-0.45 degC vs the hourly frame -> demeaned, error 0.25 degC.
+# Errors are in physical units and divided by the prior's per-channel std at
+# runtime. Blur sigma is the Gaussian sigma (GenDA's convention), not a cutoff.
+# The stds were then CALIBRATED on a 24-hour smoke case so that the truth's own
+# misfit RMS(A(truth) - y) equals the assumed std (the `truth rel` column of
+# report_sda.md ~ 1): 0.25 -> 0.20 degC for the L4 SST, 0.045 -> 0.03 psu for
+# SSS, 0.10 -> 0.05 degC for the cloud-masked SST. A term whose assumed error is
+# below the truth misfit makes the ensemble fit representation error as signal.
+# SSHA products carry `anomaly: true`: they are anomalies relative to a mean sea
+# surface, so the operator blurs the state ANOMALY. Without it the blurred mean
+# dynamic topography (0.25 m RMS across a 256 patch of the Gulf Stream) sat in
+# A(x) but not in y, and the truth misfit read 5x the assumed error.
+name: gs_store_obs
+defaults: {gamma: 0.1, border_px: auto, time_match: nearest}
+terms:
+  # GOES-like SST under the real cloud mask; native resolution. Residual vs
+  # truth is 0.02-0.05 degC with tails to 1.5 degC at fronts, hence 0.10.
+  - {name: sst_sat,   var: sst,   kind: pointwise, y_source: "store:sst_sat",
+     mask: {source: store_finite, var: sst_sat}, noise_std: 0.05}
+  # AVISO-like SSHA: 65 km Gaussian (36 px) of the daily-mean SSH. With the
+  # anomaly operator the truth misfit over a 256 patch is 0.01-0.04 m (mean
+  # 0.023) across the last week of the record; 0.03 m keeps `truth rel` ~ 1.
+  - {name: ssh_aviso, var: ssh,   kind: blur, sigma_km: 65, demean: true, anomaly: true,
+     y_source: "store:ssha_aviso", mask: {source: full}, noise_std: 0.03}
+  # OSTIA-like L4 SST: daily mean, sigma 2-4 km.
+  - {name: sst_l4,    var: sst,   kind: blur, sigma_km: 3, demean: true,
+     y_source: "store:sst_radiometer", mask: {source: full}, noise_std: 0.20}
+  # CATDS-like SSS: weekly, sigma 51 km (28 px); 0.035-0.045 psu vs hourly.
+  - {name: sss_l4,    var: sss,   kind: blur, sigma_km: 51,
+     y_source: "store:sss_sat", mask: {source: full}, noise_std: 0.03}
+  # Wind stress = the forcing, taken as known (GenDA treats ERA5 winds as fully
+  # observed with std 1e-2 in normalised units).
+  - {name: tau_x,     var: tau_x, kind: pointwise, y_source: truth,
+     mask: {source: full}, noise_std_norm: 1.0e-2}
+  - {name: tau_y,     var: tau_y, kind: pointwise, y_source: truth,
+     mask: {source: full}, noise_std_norm: 1.0e-2}
+optional_terms:
+  # SWOT-like swaths exist in 6.6% of hours only (55 in val); pick days with
+  # `sda.case --require-coverage ssha_swot`. Per-swath offset from the hour
+  # mismatch is absorbed by demeaning; residual 0.007-0.085 m.
+  - {name: ssh_swot,  var: ssh,   kind: pointwise, demean: true, anomaly: true, y_source: "store:ssha_swot",
+     mask: {source: store_finite, var: ssha_swot}, noise_std: 0.05}
