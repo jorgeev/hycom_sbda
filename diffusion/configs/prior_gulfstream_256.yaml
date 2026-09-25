@@ -1,0 +1,125 @@
+# Unconditional joint prior on the Gulf Stream HYCOM family -- the first
+# experiment on a dataset the diffusion code was not written for.
+#
+# Structurally this is prior_genda_masked.yaml (GenDA parity arm B) moved to a
+# new domain: same architecture, same schedule, same EDM settings. What changes
+# is the variable set and the climatology treatment below; the store layout
+# itself is entirely in `dataset:`, and no line of Python knows it exists.
+dataset: diffusion/datasets/gulfstream.yaml
+
+# --- variables ----------------------------------------------------------
+# Fully unconditional joint prior: 7 in / 7 out, no aux channels. Beyond the
+# three state variables this adds the ageostrophic velocity (uag, vag) and the
+# wind stress that drives it (tau_x, tau_y) -- the forcing and the response to
+# it, so the prior can learn the relationship rather than being handed one side
+# of it. Note the store's names are `tau_x`/`tau_y`, not `taux`/`tauy`.
+#
+# `use_ocean_mask` is off both because a GenDA prior takes none and because this
+# domain's mask is all ocean -- the channel would be a constant plane carrying
+# no information.
+target: [ssh, sst, sss, uag, vag, tau_x, tau_y]
+cond_vars: []
+use_ocean_mask: false
+use_doy: false
+k_days: 1                     # one step (here: one hour) of state per sample
+
+# --- data / patches ------------------------------------------------------
+# The base cadence is HOURLY, so `k_days`, `crops_per_day` and `n_eval_days`
+# all count hours in this config. 4367 hourly steps, split 3493/874 by the
+# manifest boundary.
+patch: 256
+crop_mode: grid
+reject_land: false
+ocean_frac: 0.5               # trivially satisfied: the mask is all ocean
+crops_per_day: 8
+norm_mode: anomaly
+
+# --- climatology ---------------------------------------------------------
+# SST and SSS carry a seasonal cycle here that dwarfs everything else. Measured
+# per-pixel over the record, the fraction of variance sitting in the monthly
+# means is 84% for sst and 45% for sss, against 22% for ssh, 9% for tau_x and
+# 2-4% for uag/vag/tau_y. Left in, the sst channel would be almost entirely a
+# spring warming ramp -- 20.2 degC in March to 26.4 degC in July -- and the
+# network would spend its capacity reproducing that instead of the mesoscale.
+# So those two lose a climatology; the other five keep a plain per-pixel
+# time-mean, which is what an empty entry in this list means.
+clim_vars: [sst, sss]
+
+# MONTHLY, not the default harmonic. data.py's harmonic basis is annual +
+# semiannual, and this record spans 2017-01-01 to 2017-07-01 -- about half a
+# period, from which an annual cycle is simply not identifiable; the fit would
+# latch onto whatever transient happens to be present and subtract it from the
+# field being modelled. The monthly basis has no such requirement: it is twelve
+# per-pixel values interpolated smoothly in day-of-year, and the six months this
+# record does cover each constrain their own value directly. Smooth rather than
+# stepped matters on an hourly record -- a hard monthly bin would put a ~2 degC
+# discontinuity in the sst anomaly at midnight on the 1st, a pure artifact of
+# the binning.
+clim_mode: monthly
+
+# Fit that climatology over EVERY step, not just the train split. The manifest's
+# train boundary is hour 3493 = 2017-05-26, so train covers Jan-May(26) and val
+# is May(26-31) + all of June + one day of July. June and July are therefore
+# absent from the train split entirely -- 744 of the 874 val steps, 85% of
+# validation -- and a train-only monthly fit has no coefficient for them, so
+# their climatology would fall back to the per-pixel time-mean and the full ~2
+# degC seasonal offset would stay in the residual for every one of those steps.
+# Widening the window is a deliberate and bounded leak: the smooth monthly mean
+# field and nothing else crosses the split (the anomaly std stays train-only).
+# It does make val metrics optimistic, since val anomalies are then measured
+# against June's own monthly mean -- read them as a relative signal, not an
+# absolute skill estimate.
+clim_full_record: true
+
+# Measured on the real store, the monthly climatology removes 87% of sst's
+# per-pixel variance (raw std 2.12 degC -> residual 0.76) and 84% of sss's
+# (0.170 psu -> 0.068), against 24% and 59% for a plain time-mean. The residual
+# domain-mean bias is within +-0.12 degC for January through June. July is the
+# one exception at +0.26 degC: the record ends 2017-07-01 23:00, so that month
+# is constrained by 24 hours alone and the ridge in fit_climatology shrinks it
+# partway back toward the time-mean. That is 24 of 4367 steps, all at the very
+# end of the val split -- harmless, but it is why the last day of the record
+# should not be read as a clean anomaly.
+val_gap_days: 0
+
+# --- model ------------------------------------------------------------------
+arch: genda
+model_channels: 64
+channel_mult: [1, 2, 2, 2]    # 3 downsamples; 576x936 divides by 8 cleanly
+num_blocks: 2
+attn_resolutions: [16]
+dropout: 0.13
+
+# --- EDM --------------------------------------------------------------------
+sigma_data: 0.5
+sampler_steps: 32
+s_churn: 10.0
+s_noise: 1.0
+
+# --- optimisation ----------------------------------------------------------
+# NOTE ON MEMORY: data.py preloads every channel of the whole hourly axis, so
+# the seven targets cost 7 x 4367 x 576 x 936 x 4 B = 66 GB of host RAM *per
+# rank* (train and val share the buffers within a rank, DDP ranks do not share
+# across processes). Three ranks is ~198 GB, fine on the 1 TB COAPS node this
+# runs on and worth checking anywhere else before scaling the variable list up
+# further.
+mode: diffusion
+batch: 32
+lr: 2.0e-4
+lr_schedule: constant
+warmup: 156250
+steps: 2000000
+loss_reduction: masked_mean
+grad_clip: 0.0
+grad_nan_to_num: true
+ema_halflife_kimg: 500
+num_workers: 4
+
+val_every: 10000
+val_batches: 10
+
+# --- sampling / eval --------------------------------------------------------
+k_members: 24
+n_eval_days: 0                # 0 = every valid step of the split
+
+out: "${OUT_DIR:-/unity/f1/ozavala/DATA/JorgeVelasco/runs}/prior_gulfstream_geo"
