@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared plumbing for aws/launch.sh and aws/sample.sh: env-var defaults, S3
+# Shared plumbing for aws/launch.sh, aws/sample.sh and aws/eval_prior.sh: env-var defaults, S3
 # staging in, and result persistence out. Sourced, never executed.
 #
 # The path env vars (HYCOM_STORE, GULFSTREAM_MANIFEST, OUT_DIR, CACHE_DIR) are

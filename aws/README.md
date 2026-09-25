@@ -10,7 +10,8 @@ inside `aws/`.
 | `Dockerfile` | CUDA/torch image with pinned deps + source. Build context = the repo root. |
 | `launch.sh` | Single-node DDP training launcher: `torchrun`, auto-detects all visible GPUs. |
 | `sample.sh` | Single-GPU ensemble generation → `ensembles.npz`. |
-| `common.sh` | Sourced by both: env defaults, S3 stage-in, result sync-out. |
+| `eval_prior.sh` | Unconditional prior eval (the `eval.slurm` job): samples + figures. |
+| `common.sh` | Sourced by the launchers: env defaults, S3 stage-in, result sync-out. |
 
 ## How configuration flows
 
@@ -180,6 +181,29 @@ A checkpoint records the store path as it **resolved at training time**, so one 
 on the cluster and sampled here needs `ZARR_PATH=` (or `DATASET=`) to relocate it —
 `HYCOM_STORE` alone is not enough, because `sample.py` reads the checkpoint's config rather
 than the YAML.
+
+## 5. Unconditional prior
+
+`bash aws/eval_prior.sh` is the Docker form of `eval.slurm`: kernel selftest,
+unconstrained samples (`samples_full.npz`, `samples_128.npz`), then the five
+figures. `sample.sh` is a different job. The image has no `scipy` or
+`matplotlib`; the script installs them on first use. One GPU, and the ~66 GB
+host-RAM preload of the Gulf Stream record.
+
+```bash
+docker run --rm --gpus all --ipc=host --shm-size=16g \
+  -e GULFSTREAM_MANIFEST=s3://my-bucket/gulfstream/gulfstream_manifest.json \
+  -e STAGE_DIR=/mnt/nvme -v /mnt/nvme:/mnt/nvme \
+  -e CKPT=/mnt/runs/prior_gulfstream/best.pt \
+  -e OUT_DIR=/mnt/runs -e CACHE_DIR=/mnt/runs/cache -v /mnt/runs:/mnt/runs \
+  -e OUT_S3=s3://my-bucket/runs/prior_gulfstream \
+  hycom_sbda bash aws/eval_prior.sh
+```
+
+`gen_prior` re-reads the dataset descriptor, so `GULFSTREAM_MANIFEST` (and
+`STAGE_DIR`, if you stage) has to be set again. Results land in
+`<ckpt dir>/eval_step<N>/`. A later checkpoint skips the store load with
+`REAL_FROM=<that dir>`. `SKIP_FIGS=1` writes the npz files only.
 
 ## 2b. Deep Learning AMI (no Docker)
 
