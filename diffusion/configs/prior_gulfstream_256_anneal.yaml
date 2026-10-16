@@ -1,0 +1,95 @@
+# Learning-rate anneal of prior_gulfstream_256, resumed from its AWS ckpt.pt
+# (step 925,000 of a 2M constant-lr schedule).
+#
+# WHY. A sample-space checkpoint sweep on 2026-10-05 showed the 256-patch run
+# oscillating at constant lr 2e-4: total-EKE ratio 0.44 / 0.20 / 0.26 / 0.12 /
+# 0.43 at 490k / 600k / 700k / 800k / 925k, in its own 256 geometry. The 128-patch
+# run on the same recipe settled by 1M steps; this one did not, and the 10-batch
+# val loss does not track which checkpoints are the good ones. Continuing the
+# constant schedule would produce more of the same swing, so instead the rate is
+# taken to zero and the EMA is left to settle. This is a test of whether the
+# oscillation is a learning-rate problem, judged by a checkpoint sweep of the
+# snapshots in checkpoints/, not by val loss.
+#
+# WHAT CHANGES. Everything the resume needs to match -- variables, patch,
+# climatology, architecture, EDM, batch (32 x 2 ranks = the global 64 the recipe
+# is calibrated for; AWS ran 16 x 4) -- is identical to prior_gulfstream_256.yaml.
+# Only the schedule and the output directory differ:
+#
+#   lr_schedule: cosine with steps: 1,200,000. train.lr_at measures progress as
+#   (step - warmup) / (steps - warmup), so at the resume step the rate is
+#   0.5 * 2e-4 * (1 + cos(pi * 0.737)) = 3.2e-5 and reaches 0 at 1.2M: 275k
+#   steps of anneal, about 1.6 days at ~2 steps/s on two A100s here.
+#
+#   out: its own directory, seeded by hand with a COPY of the AWS run's ckpt.pt
+#   (and log.csv), so train.py resumes from it without touching the AWS
+#   artifacts. The AWS checkpoint stores /mnt/runs cache paths in its config,
+#   but train.py takes the config from THIS file, so the caches resolve to
+#   ${CACHE_DIR:-diffusion} as on any on-prem run.
+#
+# Launch (the submitting shell's environment reaches the job):
+#   OUT_DIR=/unity/g2/jvelasco/gitraw/hycom_sbda/aws_runs/runs \
+#     sbatch train.slurm diffusion/configs/prior_gulfstream_256_anneal.yaml 2 1,2
+dataset: diffusion/datasets/gulfstream.yaml
+
+# --- variables (unchanged) --------------------------------------------------
+target: [ssh, sst, sss, uag, vag, tau_x, tau_y]
+cond_vars: []
+use_ocean_mask: false
+use_doy: false
+k_days: 1
+
+# --- data / patches (unchanged) ----------------------------------------------
+patch: 256
+crop_mode: grid
+reject_land: false
+ocean_frac: 0.5
+crops_per_day: 8
+norm_mode: anomaly
+
+# --- climatology (unchanged; see prior_gulfstream.yaml for the reasoning) ---
+clim_vars: [sst, sss]
+clim_mode: monthly
+clim_full_record: true
+val_gap_days: 0
+
+# --- model (unchanged) -------------------------------------------------------
+# Note for later, not changed here because the weights must load: with three
+# downsamples a 256 patch has levels 256/128/64/32, so attn_resolutions [16]
+# selects no encoder/decoder level and only the bottleneck block attends. The
+# 128-patch run has four attention blocks at 16x16. A fresh 256 run wanting
+# parity would set attn_resolutions: [32].
+arch: genda
+model_channels: 64
+channel_mult: [1, 2, 2, 2]
+num_blocks: 2
+attn_resolutions: [16]
+dropout: 0.13
+
+# --- EDM (unchanged) ---------------------------------------------------------
+sigma_data: 0.5
+sampler_steps: 32
+s_churn: 10.0
+s_noise: 1.0
+
+# --- optimisation ------------------------------------------------------------
+mode: diffusion
+batch: 32
+lr: 2.0e-4
+lr_schedule: cosine           # was constant; see header
+warmup: 156250                # already past; kept so lr_at's progress term matches
+steps: 1200000                # was 2000000; sets where the cosine reaches 0
+loss_reduction: masked_mean
+grad_clip: 0.0
+grad_nan_to_num: true
+ema_halflife_kimg: 500
+num_workers: 4
+
+val_every: 10000              # a snapshot in checkpoints/ every 10k for the sweep
+val_batches: 10
+
+# --- sampling / eval ----------------------------------------------------------
+k_members: 24
+n_eval_days: 0
+
+out: "${OUT_DIR:-/unity/f1/ozavala/DATA/JorgeVelasco/runs}/prior_gulfstream_256_anneal"

@@ -18,3 +18,4 @@ logs/
 *.swp
 _norm_cache.json
 runs
+aws_runs

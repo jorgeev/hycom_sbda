@@ -1,0 +1,96 @@
+# Stage 3 of the large-scale-collapse test (2026-10-14): the shifted noise
+# schedule of prior_gulfstream_256_anneal_ft_hisig.yaml carried to a 512 patch.
+#
+# WHY. The 256-patch shifted-schedule arm (stage 2) fixed the large scales at
+# its own geometry (ssh patch-mean spread 0.59 -> 0.94 of real, EKE 0.48 ->
+# 0.73, PSD 40-150 km 0.50 -> 0.73, 10-40 km 0.55 -> 0.85; stable across
+# snapshots where the old-schedule control oscillated). At the full frame the
+# gain was partial (ssh domain-mean spread 0.23 -> 0.39, Frobenius 0.59 ->
+# 0.43) and the ssh bands beyond 450 km did not move, because a 256 patch holds
+# no wavelength longer than 465 km. A 512 patch holds up to 930 km and covers
+# most of the 576x936 frame, so the schedule can teach those scales too.
+#
+# WHAT CHANGES vs the 256 arm. patch 512 (crop_mode random, as the earlier
+# ft512 run), and the sigma distribution shifted by ln 2 and widened: every
+# physical scale spans twice the pixels per side, so the noise that erases it
+# doubles (the patch mean needs ~1,140 instead of ~600). p_mean 0.7, p_std 2.0,
+# sigma_max 1280, sampler_steps 48. Fractions of training draws: sigma > 120
+# 2.0 %, > 480 0.3 %, > 1000 0.1 %, < 0.05 3.2 % (256 arm: 4.8 %).
+#
+# SEED. diffusion/remap_patch_ckpt.py from
+#   aws_runs/runs/prior_gulfstream_256_anneal_ft_hisig/checkpoints/ckpt_step1260000.pt
+# (level names x2, raw = EMA = source EMA, opt and step kept, best_val dropped).
+# Two ranks on GPUs 2,3 (GPUs 0,1 hold non-SLURM jobs): global batch 16, 60k
+# steps. Evaluate with eval_aws.slurm at --size full,512 (sampler reads
+# sigma_max / sampler_steps from the checkpoint config).
+#
+# Launch:
+#   OUT_DIR=/unity/g2/jvelasco/gitraw/hycom_sbda/aws_runs/runs \
+#     sbatch train_lanes.slurm "diffusion/configs/prior_gulfstream_256_anneal_ft_hisig512.yaml:2:2,3"
+dataset: diffusion/datasets/gulfstream.yaml
+
+# --- variables (unchanged) --------------------------------------------------
+target: [ssh, sst, sss, uag, vag, tau_x, tau_y]
+cond_vars: []
+use_ocean_mask: false
+use_doy: false
+k_days: 1
+
+# --- data / patches ----------------------------------------------------------
+patch: 512                    # was 256
+crop_mode: random             # grid mode has only 4 corners at 512; random =
+                              # uniform corners, y0 in 0..64, x0 in 0..424
+reject_land: false
+ocean_frac: 0.5
+crops_per_day: 8
+norm_mode: anomaly
+
+# --- climatology (unchanged) -------------------------------------------------
+clim_vars: [sst, sss]
+clim_mode: monthly
+clim_full_record: true
+val_gap_days: 0
+
+# --- model (unchanged) -------------------------------------------------------
+# Levels at 512 are 512/256/128/64. attn_resolutions [16] again selects no
+# encoder/decoder level, so attention is the bottleneck block only -- which is
+# exactly what the source weights contain (dec.32x32_in0 -> dec.64x64_in0).
+# Adding levels here would leave their attention weights uninitialised.
+arch: genda
+model_channels: 64
+channel_mult: [1, 2, 2, 2]
+num_blocks: 2
+attn_resolutions: [16]
+dropout: 0.13
+
+# --- EDM: shifted schedule, scaled for the 512 patch ---------------------------
+sigma_data: 0.5
+p_mean: 0.7      # 256 arm: 0.0; +ln 2 because every scale spans 2x the pixels per side
+p_std: 2.0       # 256 arm: 1.8; widened so the fine scales keep ~3 % of draws below sigma 0.05
+sigma_max: 1280.0  # 256 arm: 640; the 512-patch mean (sd 0.74) is erased at 3x by ~1,140
+sampler_steps: 48  # 256 arm: 40; keeps the step density below sigma 640 the same
+s_churn: 10.0
+s_noise: 1.0
+
+# --- optimisation ------------------------------------------------------------
+mode: diffusion
+batch: 8   # per rank; 2 ranks -> global 16
+lr: 4.0e-5   # as the 256 stage-2 arms
+lr_schedule: cosine
+warmup: 1260000   # = resume step (the hisig final): no warm-up, cosine starts at progress 0
+steps: 1320000   # 60k fine-tune steps, lr -> 0 here
+loss_reduction: masked_mean
+grad_clip: 0.0
+grad_nan_to_num: true
+ema_halflife_kimg: 50   # 50k images = 3.1k steps at global batch 16
+                              # EMA follows the fine-tune instead of the 1.2M-step past
+num_workers: 4
+
+val_every: 10000              # 6 snapshots in checkpoints/ for the sweep
+val_batches: 10
+
+# --- sampling / eval ----------------------------------------------------------
+k_members: 24
+n_eval_days: 0
+
+out: "${OUT_DIR:-/unity/g2/jvelasco/gitraw/hycom_sbda/aws_runs/runs}/prior_gulfstream_256_anneal_ft_hisig512"

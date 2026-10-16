@@ -1,0 +1,108 @@
+# Stage 2 of the large-scale-collapse test (2026-10-13): fine-tune the converged
+# prior_gulfstream_256_anneal model on a noise schedule shifted to higher sigma.
+#
+# WHY. Stage 1 (aws_runs/analysis/lowk_2026-10-13) showed that the EDM defaults
+# inherited from 32-64 px images (p_mean -1.2, p_std 1.2, sigma_max 80) never
+# destroy structures longer than ~150 km on this 1.8 km grid: the noise needed
+# to erase a scale grows with the square root of the pixels it spans, and here a
+# 100 km eddy is 55 px wide, the 256-patch mean needs sigma ~600, the full
+# frame ~1,570. Training draws sigma > 10 in 0.2 % of samples and > 20 in
+# 0.02 %, so the denoiser only ever learned to RECOVER the large scales from an
+# input where they are still present (b0 == bn in the mean-trust test), never
+# to generate them. The generated power at 150-900 km is 0.42-0.54 of real,
+# at 10-40 km 1.04, and the domain-mean spread 0.21.
+#
+# WHAT CHANGES. The sigma distribution is shifted and widened, and the sampler
+# starts higher:
+#   p_mean  -1.2 -> 0.0    median sigma 0.3 -> 1.0
+#   p_std    1.2 -> 1.8    P(sigma > 60) 4e-6 -> 1.2 %, P(sigma > 240) 0 -> 0.12 %,
+#                          P(sigma < 0.05) 6.7 % -> 4.8 % (fine scales keep their share)
+#   sigma_max 80 -> 640    the 256-patch mean is erased at 3x; sampler_steps 32 -> 40
+#                          so the step density below sigma 80 stays the same.
+# The EDM loss weight (sigma^2+sd^2)/(sigma sd)^2 is unchanged. The control arm
+# (prior_gulfstream_256_anneal_ft_ctrl.yaml) runs the identical fine-tune on the
+# old schedule, so the lr bump and the EMA reset are separated from the shift.
+#
+# PASS CRITERIA (sweep of checkpoints/ in 256 and full geometry): domain-mean
+# spread and the 150-900 km band toward 1, Frobenius down, 10-40 km band not
+# degraded. The mesoscale sst/sss deficit (0.2 in every band) is a separate
+# defect and is not expected to move.
+#
+# Both arms are seeded from the anneal checkpoint ckpt_step1200000.pt (lr already
+# at 0) with diffusion/remap_patch_ckpt.py at the same patch: raw and EMA weights
+# start from the source EMA, the optimizer state and the step counter (1.2M) are
+# kept, best_val is dropped. Evaluate with eval_aws.slurm / eval.gen_prior_relocated:
+# the sampler reads sigma_max and sampler_steps from the checkpoint's config, so
+# each arm is sampled on its own schedule.
+#
+# Launch (one job, two single-rank lanes, see train_lanes.slurm):
+#   OUT_DIR=/unity/g2/jvelasco/gitraw/hycom_sbda/aws_runs/runs \
+#     sbatch train_lanes.slurm \
+#       "diffusion/configs/prior_gulfstream_256_anneal_ft_hisig.yaml:1:2 \
+#        diffusion/configs/prior_gulfstream_256_anneal_ft_ctrl.yaml:1:3"
+dataset: diffusion/datasets/gulfstream.yaml
+
+# --- variables (unchanged) --------------------------------------------------
+target: [ssh, sst, sss, uag, vag, tau_x, tau_y]
+cond_vars: []
+use_ocean_mask: false
+use_doy: false
+k_days: 1
+
+# --- data / patches (unchanged) ----------------------------------------------
+patch: 256
+crop_mode: grid
+reject_land: false
+ocean_frac: 0.5
+crops_per_day: 8
+norm_mode: anomaly
+
+# --- climatology (unchanged; see prior_gulfstream.yaml for the reasoning) ---
+clim_vars: [sst, sss]
+clim_mode: monthly
+clim_full_record: true
+val_gap_days: 0
+
+# --- model (unchanged) -------------------------------------------------------
+# Note for later, not changed here because the weights must load: with three
+# downsamples a 256 patch has levels 256/128/64/32, so attn_resolutions [16]
+# selects no encoder/decoder level and only the bottleneck block attends. The
+# 128-patch run has four attention blocks at 16x16. A fresh 256 run wanting
+# parity would set attn_resolutions: [32].
+arch: genda
+model_channels: 64
+channel_mult: [1, 2, 2, 2]
+num_blocks: 2
+attn_resolutions: [16]
+dropout: 0.13
+
+# --- EDM ---------------------------------------------------------------------
+sigma_data: 0.5
+p_mean: 0.0
+p_std: 1.8
+sigma_max: 640.0
+sampler_steps: 40
+s_churn: 10.0
+s_noise: 1.0
+
+# --- optimisation ------------------------------------------------------------
+mode: diffusion
+batch: 32   # one rank per lane (GPU 1 is held by a non-SLURM job): global batch 32, half the recipe's 64, same in both arms
+lr: 4.0e-5   # fine-tune rate; cosine to 0 over 60k steps (lr_at: progress = (step-warmup)/(steps-warmup))
+lr_schedule: cosine
+warmup: 1200000   # = resume step, so the cosine starts at progress 0 (no warm-up)
+steps: 1260000   # 60k fine-tune steps
+loss_reduction: masked_mean
+grad_clip: 0.0
+grad_nan_to_num: true
+ema_halflife_kimg: 50   # ~1.6k steps at batch 32; the 500 of the base recipe would never catch up in 60k steps
+num_workers: 4
+
+val_every: 10000   # snapshot every 10k for the sweep
+val_batches: 10
+
+# --- sampling / eval ----------------------------------------------------------
+k_members: 24
+n_eval_days: 0
+
+out: "${OUT_DIR:-/unity/g2/jvelasco/gitraw/hycom_sbda/aws_runs/runs}/prior_gulfstream_256_anneal_ft_hisig"
