@@ -127,7 +127,7 @@ class Config:
     seed: int = 0
 
     # --- model (SongUNet) ---------------------------------------------------
-    arch: str = "nemo"                   # {"nemo", "genda"} backbone
+    arch: str = "nemo"                   # {"nemo", "genda", "genllc_video"} backbone
     model_channels: int = 128
     channel_mult: list[int] = field(default_factory=lambda: [1, 2, 2, 2])
     num_blocks: int = 2
@@ -166,6 +166,38 @@ class Config:
     ckpt_every: int = 5_000
     sample_every: int = 5_000
     val_every: int = 0                   # 0 = no in-loop validation (default)
+
+    # --- temporal window (arch="genllc_video"; see diffusion/README_video.md) --
+    # Every default below describes the single-frame, single-network model, so
+    # configs and checkpoints written before these fields existed are unchanged.
+    n_frames: int = 1                    # T: frames denoised jointly (fixes the temporal bias table)
+    frame_stride: int = 1                # base-cadence steps between frames (1 = consecutive)
+    # Variables fed as per-frame patch-mean scalars through the embedding
+    # instead of being generated (GenLLC's flux labels). A variable is EITHER in
+    # ``target`` (generated) or here (label); moving a name between the two
+    # lists is the switch.
+    label_vars: list[str] = field(default_factory=list)
+    label_dropout: float = 0.0
+    use_calendar: bool = False           # local-solar-time + day-of-year harmonics as input channels
+    calendar_harmonics: int = 6          # -> 4 * harmonics input channels
+    lon_path: str = "coords/lon"         # per-pixel longitude array in the store (degrees east)
+    # Video backbone. Like ``attn_resolutions`` these are absolute resolutions
+    # (img_resolution >> level): scale them with ``patch`` when fine-tuning at
+    # another patch size so attention stays on the same levels.
+    temporal_attn_resolutions: list[int] = field(default_factory=lambda: [64, 32, 16])
+    temporal_attn_residual: bool = True  # False = GenLLC4320 as committed (output replaces features)
+    channels_per_head: int = 64
+    grad_checkpoint: bool = False        # recompute block activations in backward: less memory, slower
+
+    # --- noise sampling / experts -------------------------------------------
+    sigma_sampling: str = "lognormal"    # {"lognormal", "loguniform"} training draw
+    # Training range for ``loguniform``. Distinct from ``sigma_min``/``sigma_max``
+    # above, which stay the SAMPLER's bounds.
+    train_sigma_min: float = 0.002
+    train_sigma_max: float = 80.0
+    expert: str = ""                     # "small" | "large" | "" (one network for all sigma)
+    sigma_divide: float = 0.5            # the sampler uses the large expert above this sigma
+    accum: int = 1                       # gradient-accumulation rounds per optimiser step
 
     # ---------------------------------------------------------------------
     def n_extra(self) -> int:

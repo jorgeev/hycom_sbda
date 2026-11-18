@@ -1,0 +1,72 @@
+# Tiny video model for tests -- NOT a training recipe.
+#
+# Same code path as video_gulfstream_small.yaml (multi-frame windows, calendar
+# channels, log-uniform sigma, temporal attention) at a size that trains a few
+# steps in seconds and fits anywhere: 3 variables, 3 frames, patch 64, a
+# three-level 32-wide network. Used by the selftests and the smoke runs in
+# diffusion/README_video.md, usually with --max-days to shorten the preload.
+dataset: diffusion/datasets/gulfstream.yaml
+
+target: [ssh, sst, tau_x]
+label_vars: []
+cond_vars: []
+use_ocean_mask: false
+use_doy: false
+k_days: 1
+
+n_frames: 3
+frame_stride: 1
+use_calendar: true
+calendar_harmonics: 6
+
+patch: 64
+crop_mode: grid
+ocean_frac: 0.5
+crops_per_day: 8
+norm_mode: anomaly
+clim_vars: [sst]
+clim_mode: monthly
+clim_full_record: true
+
+arch: genllc_video
+model_channels: 32
+channel_mult: [1, 2, 2]          # 64 -> 32 -> 16
+num_blocks: 1
+attn_resolutions: [16]
+temporal_attn_resolutions: [32, 16]
+channels_per_head: 16
+dropout: 0.0
+
+sigma_data: 1.0
+sigma_sampling: loguniform
+train_sigma_min: 0.001
+train_sigma_max: 1.0
+expert: small
+sigma_divide: 0.5
+sigma_min: 0.002
+sigma_max: 200.0
+sampler_steps: 8
+s_churn: 0.0
+
+mode: diffusion
+batch: 4
+accum: 1
+lr: 2.0e-4
+lr_schedule: cosine
+warmup: 5
+steps: 30
+loss_reduction: masked_mean
+grad_clip: 0.0
+grad_nan_to_num: true
+ema_halflife_kimg: 500
+num_workers: 2
+
+log_every: 5
+ckpt_every: 10
+val_every: 10
+val_batches: 2
+
+k_members: 2
+n_eval_days: 2
+
+out: "${OUT_DIR:-runs}/video_smoke_small"
