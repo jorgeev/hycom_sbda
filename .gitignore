@@ -2,6 +2,7 @@ __pycache__/
 .claude/
 .cursor/
 .vscode/
+drafted_docs/
 
 # generated artifacts -- checkpoints, ensembles, caches, figures, logs
 runs/
