@@ -76,10 +76,22 @@ values: `--set "target=[ssh, sst]"`, `--set n_frames=3`).
 
 `global batch = batch (per GPU) x GPUs x accum`. The template is written for a
 global batch of 48 and its `steps`, `warmup` and EMA half-life assume it.
-`batch: 3` is about what the full-size network fits on an 80 GB A100 at
+`batch: 3` is the most the full-size network fits on an 80 GB A100 at
 5 frames x 256^2, so 48 is reached with 16 GPUs, or 8 GPUs and `accum: 2`, or
 one GPU and `accum: 16`. `aws/launch_video.sh` prints the product and warns when
 it is not 48.
+
+Measured on one A100-80GB, template network, bf16 (2026-11-18):
+
+| setting | peak memory | time per step |
+|---|---|---|
+| batch 3 | 69 GB | 0.97 s |
+| batch 4 | out of memory | |
+| batch 4, `grad_checkpoint: true` | 20 GB | 1.65 s |
+| 2 ranks x batch 2 x accum 2 (DDP) | 48 GB per GPU | 1.36 s |
+
+That is 0.32 s per sample per GPU, about 900 A100-hours for the 10 M samples of
+one expert. A checkpoint (weights, EMA, optimiser) is 2.6 GB.
 
 Host RAM is per rank and per variable (9.4 GB for each hourly gulfstream
 variable), independent of the number of frames.

@@ -135,13 +135,18 @@ s_noise: 1.0
 #
 #   global batch = batch (per GPU) x GPUs x accum
 #
-# `batch: 3` is roughly what the full-size network fits on an 80 GB A100 at
-# 5 frames x 256^2. Reach 48 with any of:
+# `batch: 3` is the most this network fits on an 80 GB A100 at 5 frames x 256^2
+# (measured 2026-11-18, bf16: 69 GB and 0.97 s per step; batch 4 runs out of
+# memory). Reach 48 with any of:
 #     16 GPUs x batch 3 x accum 1      (this file as written)
 #      8 GPUs x batch 3 x accum 2      ACCUM=2 bash aws/launch_video.sh
 #      1 GPU  x batch 3 x accum 16     local run-checks
+# or turn on `grad_checkpoint`: about 5 GB per sample instead of 23 (measured up
+# to batch 4), for roughly 30 % more time per sample, so far fewer GPUs are
+# needed for the same global batch.
 # `steps` counts OPTIMISER steps: 208334 x 48 = 10 M samples. `warmup` is also
-# in optimiser steps (1042 x 48 = 50 k samples).
+# in optimiser steps (1042 x 48 = 50 k samples). At 0.32 s per sample per A100
+# the 10 M samples are about 900 A100-hours per expert.
 #
 # HOST RAM: every DDP rank preloads the whole hourly record of every listed
 # variable -- 9.4 GB each, so 66 GB per rank for these seven (528 GB at 8 ranks,
