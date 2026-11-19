@@ -26,7 +26,7 @@ calendar_harmonics: 6
 lon_path: coords/lon
 
 patch: 256
-crop_mode: grid
+crop_mode: random
 reject_land: false
 ocean_frac: 0.5
 crops_per_day: 8
