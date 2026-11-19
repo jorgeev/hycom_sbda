@@ -62,6 +62,8 @@ echo "[gpu] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (SLURM_STEP_GPUS=${SLURM_
 export MPLCONFIGDIR="${SLURM_TMPDIR:-$HOME/.cache}/matplotlib"
 mkdir -p "$MPLCONFIGDIR" logs
 export PYTHONUNBUFFERED=1
+# Avoid allocator fragmentation near the memory limit (see aws/launch_video.sh).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 CONFIG="${1:-diffusion/configs/video_gulfstream_small.yaml}"
 NRANKS="${2:-3}"

@@ -93,6 +93,23 @@ Measured on one A100-80GB, template network, bf16 (2026-11-18):
 That is 0.32 s per sample per GPU, about 900 A100-hours for the 10 M samples of
 one expert. A checkpoint (weights, EMA, optimiser) is 2.6 GB.
 
+How it scales (synthetic tensors, same network; real training adds about 1 GB
+for the EMA copy):
+
+| frames x variables | largest batch per A100 | with `grad_checkpoint: true` |
+|---|---|---|
+| 5 x 7 or 8 | 3 (68.5 GB, 0.32 s/sample) | 12 (55.6 GB, 0.40 s/sample) |
+| 6 x 7 or 8 | 2 (55.2 GB, 0.38 s/sample) | 12 (66.4 GB, 0.47 s/sample) |
+| 12 x 8 | 1 (55.3 GB, 0.75 s/sample) | 6 (66.4 GB, 0.92 s/sample) |
+
+GPU memory follows the number of FRAMES (about 4.4 GB per sample per frame
+without checkpointing); the number of variables does not move it. Variables
+cost host RAM instead: 9.4 GB per rank per hourly variable.
+
+The launchers set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`. Without
+it the 12-frame batch-6 case fails from allocator fragmentation with 22 GB
+still free.
+
 Host RAM is per rank and per variable (9.4 GB for each hourly gulfstream
 variable), independent of the number of frames.
 

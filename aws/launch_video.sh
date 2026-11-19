@@ -30,6 +30,13 @@ CONFIG="${CONFIG:?set CONFIG, e.g. diffusion/configs/video_gulfstream_small.yaml
 # (see the note in aws/launch.sh).
 NGPU="${NGPU:-$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || echo 1)}"
 
+# Avoid allocator fragmentation near the memory limit. With the default
+# allocator a 12-frame, batch-6, grad_checkpoint run failed on an 80 GB A100
+# with 54.6 GB in use and 22.8 GB "reserved but unallocated"; with expandable
+# segments it runs at 66.4 GB (measured 2026-11-19). Respects a value set by
+# the caller.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # ---------------------------------------------------------------------------
 # Batch semantics -- read this before scaling up
 # ---------------------------------------------------------------------------

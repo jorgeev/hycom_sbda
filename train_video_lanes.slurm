@@ -42,6 +42,8 @@ LANES="${1:?usage: train_video_lanes.slurm \"<config>:<nranks>:<gpu-list> ...\"}
 export MPLCONFIGDIR="${SLURM_TMPDIR:-$HOME/.cache}/matplotlib"
 mkdir -p "$MPLCONFIGDIR" logs
 export PYTHONUNBUFFERED=1
+# Avoid allocator fragmentation near the memory limit (see aws/launch_video.sh).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 JOB="${SLURM_JOB_ID:-manual}"
 
 pids=(); names=()
