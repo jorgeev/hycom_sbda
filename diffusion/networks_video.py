@@ -381,7 +381,11 @@ class VideoUNet(nn.Module):
     ``in_channels`` counts everything concatenated on the channel axis by the
     caller (noisy state, conditioning channels, calendar channels).
     ``noise_labels`` is ``(B, T)``; ``labels`` is ``(B, T, label_dim)`` or
-    ``None`` when ``label_dim == 0``.
+    ``None`` when ``label_dim == 0``. Labels are used as given: nothing here
+    rescales them, and ``map_label`` is initialised for a unit-norm vector, so
+    callers hand in values of order one (:func:`video_label_dim` says how many).
+    ``label_dropout`` zeroes the WHOLE label vector of a frame, tidal phases
+    included.
     """
 
     def __init__(self, in_channels: int, out_channels: int, img_resolution: int = 256,
@@ -494,6 +498,12 @@ def video_in_channels(cfg) -> int:
     return c
 
 
+def video_label_dim(cfg) -> int:
+    """Scalar labels per frame: one per ``label_vars`` entry, then cos and sin
+    for each ``tidal_labels`` constituent (:mod:`diffusion.tides`)."""
+    return len(cfg.label_vars) + 2 * len(cfg.tidal_labels)
+
+
 def build_video_unet(cfg) -> VideoUNet:
     return VideoUNet(
         in_channels=video_in_channels(cfg),
@@ -505,7 +515,7 @@ def build_video_unet(cfg) -> VideoUNet:
         attn_resolutions=tuple(cfg.attn_resolutions),
         temporal_attn_resolutions=tuple(cfg.temporal_attn_resolutions),
         dropout=cfg.dropout,
-        label_dim=len(cfg.label_vars),
+        label_dim=video_label_dim(cfg),
         label_dropout=cfg.label_dropout,
         n_frames=cfg.n_frames,
         channels_per_head=cfg.channels_per_head,

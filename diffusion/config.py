@@ -178,6 +178,14 @@ class Config:
     # lists is the switch.
     label_vars: list[str] = field(default_factory=list)
     label_dropout: float = 0.0
+    # Tidal phase labels (diffusion/tides.py): for each constituent listed, cos
+    # and sin of its phase at the frame's time, appended AFTER the ``label_vars``
+    # scalars. Computed from the timestamp, so nothing is read from the store.
+    # Empty = none. ``tidal_epoch`` is the phase origin in unix seconds (an
+    # integer on purpose: YAML turns an ISO date string into a datetime); the
+    # default is the first snapshot of the harmonic fit, 2017-01-01T01:00:00Z.
+    tidal_labels: list[str] = field(default_factory=list)
+    tidal_epoch: int = 1483232400
     use_calendar: bool = False           # local-solar-time + day-of-year harmonics as input channels
     calendar_harmonics: int = 6          # -> 4 * harmonics input channels
     lon_path: str = "coords/lon"         # per-pixel longitude array in the store (degrees east)

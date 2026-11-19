@@ -9,7 +9,8 @@ and everything the network is told beyond the noisy state travels in one
       "sod":    (B, T)            UTC second of day of each frame   } calendar,
       "doy":    (B, T)            fraction of the year in [0, 1)    } when the
       "lon":    (B, H, W)         degrees east                      } model uses it
-      "labels": (B, T, L)         per-frame scalar labels (optional)
+      "labels": (B, T, L)         per-frame scalar labels: label_vars means,
+                                  then tidal phases (optional)
     }
 
 Two things follow GenLLC4320 rather than :mod:`diffusion.edm`:

@@ -29,7 +29,7 @@ defaults describe the single-frame model.
   64 channels per head. About 160 M parameters with the template.
 - **Inputs beyond the noisy state**, all optional and all from the YAML:
   calendar channels (`use_calendar`), per-frame input fields (`cond_vars`,
-  `use_ocean_mask`), per-frame scalar labels (`label_vars`).
+  `use_ocean_mask`), per-frame scalar labels (`label_vars`, `tidal_labels`).
 - **Two experts**: one network trained on sigma log-uniform in `[0.001, 1]`,
   another on `[0.1, 200]`; the sampler uses the second above `sigma_divide`
   (0.5). Each expert is an ordinary run with its own config and output dir.
@@ -40,12 +40,60 @@ to one ocean-mean scalar per frame and fed through the embedding. Wind stress is
 generated in the template; moving `tau_x, tau_y` from `target` to `label_vars`
 turns it into GenLLC4320-style scalar conditioning.
 
+### Tidal phase labels
+
+The frames are hourly snapshots that contain the tide (about half of the
+anomaly-normalised SSH channel), and the calendar channels carry solar time
+only, so without help the model has to invent the phase of the lunar tide for
+every sample. `tidal_labels` gives it that phase as scalar labels:
+
+```yaml
+tidal_labels: [K1, O1, P1, Q1, M2, S2, N2, K2]   # empty (the default) = none
+tidal_epoch: 1483232400                          # 2017-01-01T01:00:00Z, unix seconds
+```
+
+- **What the network gets.** For every frame, cos and sin of each listed
+  constituent's phase at the frame's time, `speed * (t - tidal_epoch)`, divided
+  by `sqrt(K)` so the vector has unit length (`diffusion/tides.py`). They are
+  appended after the `label_vars` scalars and go through the same embedding.
+  Eight constituents are 16 labels and 8,192 extra weights; GPU memory and step
+  time do not change.
+- **Nothing is read from the store.** The labels depend on the timestamp alone,
+  so they are the same for every crop and for the full frame, and they are
+  known for any date. `sample_video --labels zero` therefore zeroes the
+  `label_vars` scalars only.
+- **The order and the epoch match the harmonic fit** written by
+  `extract_hycom_tides.py` (`K1_cos, K1_sin, O1_cos, ...`, phase origin at its
+  first snapshot). Its fitted tide is `coefficient maps x labels x sqrt(K)`;
+  `python -m diffusion.tides --selftest` checks that where the files exist.
+- **SSH is not changed.** The tide is still part of the generated field; the
+  labels only say where in the cycle each frame is.
+- **Configs.** `video_gulfstream_tide_{small,large}.yaml` are the template pair
+  plus these keys, with their own output directories.
+
+Things to know:
+
+- A tide run starts from step 0. Checkpoints trained without the labels have no
+  label layer; `--init-from` and the sampler's pair check refuse to mix them.
+- P1 and K2 differ from K1 and S2 by 0.082 deg/hour, a 182.6-day beat, about
+  the length of the gulfstream record. The training months cover 287 degrees of
+  that relative phase and the validation months the other 72, which training
+  never shows. The other pairs are well sampled (M2-S2 14.8 days, K1-O1 13.7,
+  M2-N2 27.6). Listing six constituents without P1 and K2 avoids it.
+- S2 turns exactly twice per solar day, so it repeats the second solar-time
+  harmonic of the calendar channels. Harmless.
+- `label_dropout > 0` zeroes the whole label vector of a frame, tidal phases
+  included.
+- These are fixed-speed harmonics with no nodal corrections, as in the fit.
+  They are exact for that fit and drift from the real tide over years.
+
 ## Run it
 
 ```bash
 conda activate datorch && cd <repo>
 
 # selftests (CPU; the last one reads the store)
+python -m diffusion.tides --selftest
 python -m diffusion.networks_video --selftest
 python -m diffusion.edm_video --selftest
 python -m diffusion.train_video --selftest
@@ -59,6 +107,8 @@ CUDA_VISIBLE_DEVICES=2 python -m diffusion.train_video \
     --set expert=large --set train_sigma_min=0.1 --set train_sigma_max=200
 CUDA_VISIBLE_DEVICES=2 python -m diffusion.sample_video --small runs/vs_small \
     --large runs/vs_large --split train --max-days 400 --windows 2 --k-members 2
+# the same smoke run with tidal phase labels: add this to BOTH training commands
+#     --set "tidal_labels=[K1,O1,P1,Q1,M2,S2,N2,K2]"
 
 # the two experts side by side on the local node (one lane each)
 sbatch train_video_lanes.slurm \
@@ -152,8 +202,12 @@ levels); there is no tiling.
 - Guided assimilation over windows (`sda/`). `ExpertSwitch` already exposes the
   `d_fn(x, sigma)` interface `sda/vpsde.py` and `sda/guidance.py` consume.
 - Tiled (multidiffusion) inference for domains or windows larger than one pass.
-- Scalar labels at full frame are full-frame means, a different statistic from
-  the patch means seen in training.
+- `label_vars` scalars at full frame are full-frame means, a different
+  statistic from the patch means seen in training (tidal phase labels do not
+  depend on the crop).
+- Removing the fitted tide from SSH before training and adding it back after
+  sampling. The tidal labels are the phase half of that; the amplitude maps are
+  not used by the model.
 
 ## Differences from GenLLC4320 worth knowing
 
@@ -161,6 +215,7 @@ levels); there is no tiling.
 |---|---|---|
 | frames | 12-hour means of tide-removed, inertial-low-passed fields | hourly snapshots as stored |
 | forcing | patch-mean wind stress and shortwave as labels | wind stress generated (switchable to labels) |
+| tide | removed before training | kept in the fields; its phase optionally given as labels (`tidal_labels`) |
 | temporal attention | output replaces the features | added to them (`temporal_attn_residual: false` restores the original) |
 | normalisation | per-sample mean removed from SST/SSS | per-pixel monthly climatology (`norm_mode: anomaly`) |
 | sampler | VP predictor-corrector | EDM Heun by default, VP available |

@@ -39,7 +39,8 @@ from .data_video import ZarrVideoDataset, batch_ctx
 from .dataset_spec import resolve_spec
 from .edm_video import VideoEDMLoss, VideoPrecond
 from .ema import EMA
-from .networks_video import attention_levels, build_video_unet, video_in_channels
+from .networks_video import (attention_levels, build_video_unet, video_in_channels,
+                             video_label_dim)
 from .train import lr_at, save_ckpt
 from .utils import CSVLogger, cleanup_ddp, is_main, seed_everything, setup_ddp
 
@@ -63,7 +64,8 @@ def build_loss(cfg: Config) -> VideoEDMLoss:
 # ---------------------------------------------------------------------------
 # --init-from: is a checkpoint weight-compatible with this config?
 # ---------------------------------------------------------------------------
-_SAME_KEYS = ("target", "cond_vars", "label_vars", "use_ocean_mask", "use_calendar",
+_SAME_KEYS = ("target", "cond_vars", "label_vars", "tidal_labels", "tidal_epoch",
+              "use_ocean_mask", "use_calendar",
               "calendar_harmonics", "n_frames", "model_channels", "channel_mult",
               "num_blocks", "channels_per_head")
 
@@ -158,7 +160,7 @@ def main():
         n_par = sum(p.numel() for p in net.parameters())
         print(f"[cfg] arch={cfg.arch} expert={cfg.expert or '-'} T={cfg.n_frames} "
               f"stride={cfg.frame_stride} Ct={len(cfg.target)} "
-              f"in_ch={video_in_channels(cfg)} labels={len(cfg.label_vars)} "
+              f"in_ch={video_in_channels(cfg)} labels={video_label_dim(cfg)} "
               f"params={n_par:,}")
         print(f"[cfg] attention levels {net.model.attn_levels} at patch {cfg.patch}; "
               f"sigma {cfg.sigma_sampling}"
@@ -353,6 +355,23 @@ def _selftest() -> None:
     assert len(p) == 2 and any("n_frames" in s for s in p) and any("target" in s for s in p)
     assert _parse_set(["expert=large", "train_sigma_min=0.1", "target=[x, y]"]) == {
         "expert": "large", "train_sigma_min": 0.1, "target": ["x", "y"]}
+    # tidal labels change the label layer's width, so a checkpoint without them
+    # (or written before the key existed) cannot seed a config that has them
+    tides = ["K1", "O1", "P1", "Q1", "M2", "S2", "N2", "K2"]
+    with_t = Config(**{**base, "tidal_labels": tides})
+    assert video_label_dim(Config(**base)) == 0 and video_label_dim(with_t) == 16
+    assert video_label_dim(Config(**{**base, "target": ["a"], "label_vars": ["b"],
+                                     "tidal_labels": tides[:2]})) == 5
+    p = check_init_compat(with_t, src)
+    assert len(p) == 1 and "tidal_labels" in p[0], p
+    old = {k: v for k, v in src.items() if k not in ("tidal_labels", "tidal_epoch")}
+    assert check_init_compat(Config(**base), old) == []
+    assert len(check_init_compat(with_t, old)) == 1
+    assert check_init_compat(with_t, with_t.as_dict()) == []
+    p = check_init_compat(Config(**{**base, "tidal_labels": tides, "tidal_epoch": 0}),
+                          with_t.as_dict())
+    assert len(p) == 1 and "tidal_epoch" in p[0], p
+    assert _parse_set(["tidal_labels=[K1,O1,P1,Q1,M2,S2,N2,K2]"]) == {"tidal_labels": tides}
     print("[ok] --init-from compatibility check and --set parsing")
     print("train_video selftest passed")
 

@@ -9,7 +9,9 @@ small-sigma one below (:class:`diffusion.edm_video.ExpertSwitch`).
 
 For each chosen window start the script takes that window's calendar inputs
 (and labels, when the model has any) from the store, generates ``K`` members,
-and writes generated and true fields in physical units to one ``.npz``:
+and writes generated and true fields in physical units to one ``.npz``.
+``--labels zero`` zeroes the store-variable labels (``label_vars``) only: tidal
+phase labels come from the window's timestamps and are always given.
 
     gen_<var>    (n_windows, K, T, H, W)
     truth_<var>  (n_windows, T, H, W)
@@ -38,7 +40,8 @@ from .train_video import build_video_precond
 
 # Keys the two experts must agree on: they define the state, the inputs and the
 # normalisation, i.e. everything that makes their outputs interchangeable.
-_PAIR_KEYS = ("dataset", "target", "cond_vars", "label_vars", "use_ocean_mask",
+_PAIR_KEYS = ("dataset", "target", "cond_vars", "label_vars", "tidal_labels",
+              "tidal_epoch", "use_ocean_mask",
               "use_calendar", "calendar_harmonics", "n_frames", "frame_stride",
               "norm_mode", "clim_vars", "clim_mode", "clim_full_record")
 
@@ -122,7 +125,12 @@ def sample_windows(switch: ExpertSwitch, cfg: Config, ds: ZarrVideoDataset, star
         ysl, xsl = window_slices(ds, size, start, seed)
         item = ds.window(start, ysl, xsl)
         h, w = item["mask"].shape[-2:]
-        lab = item["labels"] if labels == "truth" else torch.zeros_like(item["labels"])
+        lab = item["labels"]
+        if labels == "zero":
+            # only the store-variable labels: the tidal phases that follow them
+            # are known for any date, and an all-zero phase is not a phase
+            lab = lab.clone()
+            lab[:, : len(cfg.label_vars)] = 0.0
         base = {"cond": item["cond"], "labels": lab, "sod": item["sod"],
                 "doy": item["doy"], "lon": item["lon"]}
         members, remaining, off = [], k_members, 0
@@ -180,7 +188,8 @@ def main():
     ap.add_argument("--size", default="patch",
                     help="'patch' (training patch), 'full', or an integer N")
     ap.add_argument("--labels", default="truth", choices=["truth", "zero"],
-                    help="scalar labels from the store window, or zeros")
+                    help="label_vars scalars from the store window, or zeros "
+                         "(tidal phase labels are always given)")
     ap.add_argument("--member-batch", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-days", type=int, default=None,

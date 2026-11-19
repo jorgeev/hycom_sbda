@@ -13,7 +13,10 @@ One sample (before collation):
     cond   (T, Cc, H, W)   per-frame input channels: each ``cfg.cond_vars`` entry
                            at that frame's time, then the ocean mask if
                            ``use_ocean_mask`` (zero-width when there are none)
-    labels (T, L)          ocean-mean of each ``cfg.label_vars`` field per frame
+    labels (T, L)          ocean-mean of each ``cfg.label_vars`` field per frame,
+                           then cos and sin of each ``cfg.tidal_labels``
+                           constituent's phase at the frame's time
+                           (:mod:`diffusion.tides`; the same for every crop)
     sod    (T,)            UTC second of day of each frame
     doy    (T,)            fraction of the year in [0, 1) of each frame
     lon    (H, W)          degrees east (zeros unless ``use_calendar``)
@@ -34,6 +37,7 @@ import torch
 from .config import Config
 from .data import ZarrWindowDataset, evaluate_climatology
 from .dataset_spec import DatasetSpec, resolve_spec
+from .tides import check_constituents, tidal_labels
 
 
 def valid_window_starts(valid_steps: np.ndarray, t_unix: np.ndarray, n_frames: int,
@@ -80,6 +84,7 @@ class ZarrVideoDataset(ZarrWindowDataset):
                 "either generated (target) or a scalar label (label_vars)")
         if cfg.n_frames < 1 or cfg.frame_stride < 1:
             raise ValueError("n_frames and frame_stride must be >= 1")
+        check_constituents(cfg.tidal_labels)      # before the preload, not after
         down = 2 ** (len(cfg.channel_mult) - 1)
         if cfg.patch % down:
             raise ValueError(
@@ -105,6 +110,9 @@ class ZarrVideoDataset(ZarrWindowDataset):
         self.t_unix = spec.family.times(spec.base)[: self.t_end].astype(np.float64)
         self.year_frac = (self.doy_ang / (2.0 * np.pi)).astype(np.float32)
         self.sod = np.mod(self.t_unix, 86400.0).astype(np.float32)
+        # (t_end, 2K) tidal phase labels, zero-width when there are none. A
+        # function of the timestamp alone, so cheap enough to rebuild per dataset.
+        self.tide_phase = tidal_labels(self.t_unix, cfg.tidal_labels, cfg.tidal_epoch)
 
         single = self.valid_days                      # k=1: every usable step
         self.valid_days = valid_window_starts(single, self.t_unix, self.T, self.stride)
@@ -156,6 +164,8 @@ class ZarrVideoDataset(ZarrWindowDataset):
                  for v in cfg.label_vars], axis=1).astype(np.float32)
         else:
             labels = np.zeros((self.T, 0), dtype=np.float32)
+        if self.tide_phase.shape[1]:
+            labels = np.concatenate([labels, self.tide_phase[frames]], axis=1)
 
         lon = (self.lon[ysl, xsl] if self.lon is not None
                else np.zeros((h, w), dtype=np.float32))
@@ -244,7 +254,7 @@ def _selftest_store(config: str, max_days: int | None) -> None:
     cc = len(cfg.cond_vars) + (1 if cfg.use_ocean_mask else 0)
     assert it["target"].shape == (T, ct, p, p), it["target"].shape
     assert it["cond"].shape == (T, cc, p, p)
-    assert it["labels"].shape == (T, len(cfg.label_vars))
+    assert it["labels"].shape == (T, len(cfg.label_vars) + 2 * len(cfg.tidal_labels))
     assert it["sod"].shape == (T,) and it["doy"].shape == (T,)
     assert it["lon"].shape == (p, p) and it["mask"].shape == (1, p, p)
     print(f"[ok] sample shapes: target {tuple(it['target'].shape)}, cond "
@@ -303,9 +313,41 @@ def _selftest_store(config: str, max_days: int | None) -> None:
         assert wl["target"].shape == (T, ct - 1, p, p)
         m = (ds.ocean[ysl, xsl] > 0.5).astype(np.float32)
         ref = (w["target"][:, -1].numpy() * m).sum(axis=(1, 2)) / m.sum()
-        assert np.allclose(wl["labels"][:, -1].numpy(), ref, atol=1e-6)
+        col = len(cfg_l.label_vars) - 1          # store labels come before tidal ones
+        assert np.allclose(wl["labels"][:, col].numpy(), ref, atol=1e-6)
         print(f"[ok] moving {moved!r} from target to label_vars turns it into the "
               f"per-frame ocean mean: {np.round(ref, 3).tolist()}")
+
+    # tidal phase labels: computed from the frame times, appended after any
+    # store label, the same at every crop. Reference: datetime arithmetic.
+    from .tides import SPEED_DEG_PER_HOUR
+    names = list(SPEED_DEG_PER_HOUR)
+    flux = [cfg.target[-1]] if len(cfg.target) > 1 else []
+    cfg_t = dataclasses.replace(cfg, target=[v for v in cfg.target if v not in flux],
+                                label_vars=flux, tidal_labels=names)
+    dt = ZarrVideoDataset(cfg_t, split="train", share_from=ds, spec=ds.spec)
+    wt = dt.window(start, ysl, xsl)
+    lab = wt["labels"].numpy()
+    assert lab.shape == (T, len(flux) + 2 * len(names)) and lab.dtype == np.float32
+    origin = np.datetime64("1970-01-01T00:00:00") + np.timedelta64(int(cfg_t.tidal_epoch), "s")
+    hours = (ds.t_unix[frames].astype("datetime64[s]") - origin) / np.timedelta64(1, "h")
+    for k, n in enumerate(names):
+        ang = np.deg2rad(SPEED_DEG_PER_HOUR[n] * hours)
+        ref2 = np.stack([np.cos(ang), np.sin(ang)], axis=1) / np.sqrt(len(names))
+        assert np.allclose(lab[:, len(flux) + 2 * k: len(flux) + 2 * k + 2], ref2, atol=1e-5), n
+    assert np.allclose((lab[:, len(flux):] ** 2).sum(axis=1), 1.0, atol=1e-5)
+    if flux:
+        m = (ds.ocean[ysl, xsl] > 0.5).astype(np.float32)
+        ref = (w["target"][:, -1].numpy() * m).sum(axis=(1, 2)) / m.sum()
+        assert np.allclose(lab[:, 0], ref, atol=1e-6)
+    other = dt.window(start, slice(0, p), slice(0, p))["labels"].numpy()
+    assert np.array_equal(other[:, len(flux):], lab[:, len(flux):])
+    m2 = lab[:, len(flux) + 8: len(flux) + 10] * np.sqrt(len(names))
+    step_deg = np.rad2deg(np.unwrap(np.arctan2(m2[:, 1], m2[:, 0])))
+    print(f"[ok] tidal labels: {lab.shape[1]} per frame ({len(flux)} store + "
+          f"{2 * len(names)} phase), unit norm, crop-independent; M2 advances "
+          f"{np.diff(step_deg).mean():.2f} deg per frame from "
+          f"{ds.t_unix[frames][0].astype('datetime64[s]')}")
 
     # collation, as the DataLoader will see it
     from torch.utils.data import default_collate

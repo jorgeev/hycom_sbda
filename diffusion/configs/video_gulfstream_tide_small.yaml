@@ -1,0 +1,106 @@
+# Multi-frame prior on the Gulf Stream HYCOM family WITH TIDAL PHASE LABELS
+# -- SMALL-SIGMA EXPERT.
+#
+# video_gulfstream_small.yaml (the commented template; read that one for what
+# each key does) plus the two `tidal_*` keys below and its own `out`. The
+# large-sigma expert is video_gulfstream_tide_large.yaml; keep the two in step,
+# sample_video refuses a pair whose channels, labels, window, calendar or
+# normalisation differ.
+#
+# What the tidal labels are (diffusion/tides.py, diffusion/README_video.md):
+# for every frame, cos and sin of the phase of each constituent listed, computed
+# from the frame's timestamp and fed through the label embedding. The frames are
+# hourly snapshots that contain the tide, and the calendar channels carry solar
+# time only; these labels are what tells the model where each frame sits in the
+# lunar cycle. SSH itself is unchanged (the tide is still in the generated field).
+#
+# A tide run starts from step 0: checkpoints of the label-free pair have no label
+# layer and cannot be continued or used with --init-from here.
+#
+# Train both experts:
+#   AWS   : CONFIG=diffusion/configs/video_gulfstream_tide_small.yaml bash aws/launch_video.sh
+#   local : sbatch train_video_lanes.slurm \
+#             "diffusion/configs/video_gulfstream_tide_small.yaml:1:2 \
+#              diffusion/configs/video_gulfstream_tide_large.yaml:1:3"
+dataset: diffusion/datasets/gulfstream.yaml
+
+target: [ssh, sst, sss, uag, vag, tau_x, tau_y]
+cond_vars: []
+label_vars: []
+# The eight constituents of the harmonic fit, in its term order -> 16 labels per
+# frame. P1 and K2 separate from K1 and S2 only over 182.6 days, about the length
+# of this record: the validation months hold K1-P1 and S2-K2 phase differences
+# the training months never show. Drop those two names for a 12-label variant.
+tidal_labels: [K1, O1, P1, Q1, M2, S2, N2, K2]
+tidal_epoch: 1483232400       # 2017-01-01T01:00:00Z, the fit's phase origin (unix seconds)
+label_dropout: 0.0            # >0 would drop the tidal phases together with any label_vars
+use_ocean_mask: false
+use_doy: false
+k_days: 1
+
+n_frames: 5
+frame_stride: 1
+
+use_calendar: true
+calendar_harmonics: 6
+lon_path: coords/lon
+
+patch: 256
+crop_mode: grid
+reject_land: false
+ocean_frac: 0.5
+crops_per_day: 8
+norm_mode: anomaly
+
+clim_vars: [sst, sss]
+clim_mode: monthly
+clim_full_record: true
+val_gap_days: 0
+
+arch: genllc_video
+model_channels: 128
+channel_mult: [1, 2, 2, 3, 4]
+num_blocks: 3
+attn_resolutions: [32, 16]
+temporal_attn_resolutions: [64, 32, 16]
+channels_per_head: 64
+dropout: 0.10
+temporal_attn_residual: true
+grad_checkpoint: false
+
+sigma_data: 1.0
+sigma_sampling: loguniform
+train_sigma_min: 0.001
+train_sigma_max: 1.0
+expert: small
+sigma_divide: 0.5
+
+sigma_min: 0.002
+sigma_max: 200.0
+rho: 7.0
+sampler_steps: 64
+s_churn: 10.0
+s_noise: 1.0
+
+mode: diffusion
+batch: 3
+accum: 1
+lr: 2.0e-4
+lr_schedule: cosine
+warmup: 1042
+steps: 208334
+loss_reduction: masked_mean
+grad_clip: 0.0
+grad_nan_to_num: true
+ema_halflife_kimg: 500
+num_workers: 4
+
+log_every: 100
+ckpt_every: 1000
+val_every: 10000
+val_batches: 8
+
+k_members: 8
+n_eval_days: 8
+
+out: "${OUT_DIR:-/unity/f1/ozavala/DATA/JorgeVelasco/runs}/video_gulfstream_tide_small"
