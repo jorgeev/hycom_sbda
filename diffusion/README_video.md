@@ -70,6 +70,32 @@ tidal_epoch: 1483232400                          # 2017-01-01T01:00:00Z, unix se
   labels only say where in the cycle each frame is.
 - **Configs.** `video_gulfstream_tide_{small,large}.yaml` are the template pair
   plus these keys, with their own output directories.
+  `video_gulfstream_tide_nt_{small,large}.yaml` go one step further (below).
+
+### Tide-free SSH (`ssh_nt`), 6 frames
+
+Since 2026-11-19 the gulfstream stores also hold `ssh_nt`: `ssh` minus the
+8-constituent harmonic fit (the coherent tide), subtracted on the native grid
+before the regrid. Everything not phase-locked to those eight frequencies is
+still in it: eddies, the front, incoherent internal tides, near-inertial motion.
+
+`video_gulfstream_tide_nt_{small,large}.yaml` train on it. Relative to the tide
+pair they change three keys:
+
+| key | tide pair | tide_nt pair | why |
+|---|---|---|---|
+| `target` | `[ssh, sst, sss, uag, vag, tau_x, tau_y]` | `[ssh_nt, sst, sss, uag, vag, tau_x, tau_y]` | the tide is no longer generated; still 7 channels |
+| `n_frames` | 5 | 6 | |
+| `batch` | 3 | 2 | 6 frames x batch 3 does not fit on an 80 GB A100 (table under *Batch size*) |
+
+- The SSH channel's normalisation is fit on `ssh_nt` itself: a new variable name
+  is a new cache entry, so no stale statistics are reused.
+- With `batch: 2` the global batch of 48 needs 24 GPU-rounds: 8 GPUs x
+  `accum: 3`, 4 GPUs x `accum: 6`, or 1 GPU x `accum: 24`.
+- `uag`/`vag` (and `ug`/`vg`) were derived from `ssh`, not `ssh_nt`, and still
+  contain the tidal currents; the tidal labels still give the model the phase.
+- The sampler writes `gen_ssh_nt` and `truth_ssh_nt`. Adding the fitted tide
+  back to get full SSH is not built.
 
 Things to know:
 
@@ -205,9 +231,10 @@ levels); there is no tiling.
 - `label_vars` scalars at full frame are full-frame means, a different
   statistic from the patch means seen in training (tidal phase labels do not
   depend on the crop).
-- Removing the fitted tide from SSH before training and adding it back after
-  sampling. The tidal labels are the phase half of that; the amplitude maps are
-  not used by the model.
+- Adding the fitted tide back to a generated `ssh_nt` to get full SSH (needed to
+  compare with stored `ssh` or to assimilate SWOT, which sees the tide). It is
+  `coefficient maps x tidal labels x sqrt(K)`, but the maps exist only on the
+  raw 612x1001 grid, not on the store grid.
 
 ## Differences from GenLLC4320 worth knowing
 

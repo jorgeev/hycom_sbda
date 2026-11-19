@@ -1,0 +1,87 @@
+# Multi-frame prior on the Gulf Stream HYCOM family: 6 FRAMES, TIDE-FREE SSH
+# (`ssh_nt`), TIDAL PHASE LABELS -- LARGE-SIGMA EXPERT.
+#
+# Identical to video_gulfstream_tide_nt_small.yaml (read that one for what
+# `ssh_nt`, the 6 frames, `batch: 2` and the tidal keys do, and
+# video_gulfstream_small.yaml for every other key) except for the four keys
+# marked below. Keep the two files in step: sample_video refuses a pair whose
+# channels, labels, window, calendar or normalisation differ.
+dataset: diffusion/datasets/gulfstream.yaml
+
+target: [ssh_nt, sst, sss, uag, vag, tau_x, tau_y]
+cond_vars: []
+label_vars: []
+tidal_labels: [K1, O1, P1, Q1, M2, S2, N2, K2]
+tidal_epoch: 1483232400       # 2017-01-01T01:00:00Z, the fit's phase origin (unix seconds)
+label_dropout: 0.0
+use_ocean_mask: false
+use_doy: false
+k_days: 1
+
+n_frames: 6
+frame_stride: 1
+
+use_calendar: true
+calendar_harmonics: 6
+lon_path: coords/lon
+
+patch: 256
+crop_mode: grid
+reject_land: false
+ocean_frac: 0.5
+crops_per_day: 8
+norm_mode: anomaly
+
+clim_vars: [sst, sss]
+clim_mode: monthly
+clim_full_record: true
+val_gap_days: 0
+
+arch: genllc_video
+model_channels: 128
+channel_mult: [1, 2, 2, 3, 4]
+num_blocks: 3
+attn_resolutions: [32, 16]
+temporal_attn_resolutions: [64, 32, 16]
+channels_per_head: 64
+dropout: 0.10
+temporal_attn_residual: true
+grad_checkpoint: false
+
+sigma_data: 1.0
+sigma_sampling: loguniform
+train_sigma_min: 0.1          # <- differs from the small expert (0.001)
+train_sigma_max: 200.0        # <- differs from the small expert (1.0)
+expert: large                 # <- differs
+sigma_divide: 0.5
+
+# The sampler takes these from THIS file's checkpoint.
+sigma_min: 0.002
+sigma_max: 200.0
+rho: 7.0
+sampler_steps: 64
+s_churn: 10.0
+s_noise: 1.0
+
+mode: diffusion
+batch: 2                      # 6 frames: batch 3 does not fit on an 80 GB A100
+accum: 1
+lr: 2.0e-4
+lr_schedule: cosine
+warmup: 1042
+steps: 208334
+loss_reduction: masked_mean
+grad_clip: 0.0
+grad_nan_to_num: true
+ema_halflife_kimg: 500
+num_workers: 4
+
+log_every: 100
+ckpt_every: 1000
+val_every: 10000
+val_batches: 8
+
+k_members: 8
+n_eval_days: 8
+
+out: "${OUT_DIR:-/unity/f1/ozavala/DATA/JorgeVelasco/runs}/video_gulfstream_tide_nt_large"   # <- differs

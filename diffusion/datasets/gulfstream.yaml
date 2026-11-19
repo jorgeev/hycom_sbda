@@ -56,6 +56,13 @@ cadences:
 variables:
   # --- hourly truth ---------------------------------------------------------
   ssh:   {cadence: hourly, units: m}
+  # ssh with the coherent tide removed: ssh minus the 8-constituent harmonic fit
+  # (K1 O1 P1 Q1 M2 S2 N2 K2, fit over the whole record, subtracted on the native
+  # grid before the regrid). Added to the stores 2026-11-19. Everything not
+  # phase-locked to those frequencies is still in it (eddies, incoherent internal
+  # tides, near-inertial motion). `ug`/`vg`/`uag`/`vag` were derived from `ssh`,
+  # not from this field.
+  ssh_nt: {cadence: hourly, units: m}
   sst:   {cadence: hourly, units: degC}
   sss:   {cadence: hourly, units: psu}
   u:     {cadence: hourly, units: m s-1}
